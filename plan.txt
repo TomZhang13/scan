@@ -1,0 +1,246 @@
+{
+  "doc_id": "IPC-XYZ",
+  "sections": [{
+    "sid": "4.1.3",
+    "title": "Hardware Installation — Component Mounting — High Power",
+    "text": "…",
+    "pages": [58,59],
+    "figures": [{
+      "fid": "4-4",
+      "caption": "Figure 4-4",
+      "status": "Acceptable",
+      "image_uri": "s3://…/fig_4-4.png",
+      "bbox": [x,y,w,h],            // page coordinates (PDF user space)
+      "hotspots": [
+        {"label":"1","text":"Metal","bbox":[…]},
+        {"label":"2","text":"Terminal Lug","bbox":[…]}
+      ],
+      "legend": ["1. Metal", "2. Terminal Lug", …]
+    }]
+  }],
+  "tables": [ { "tid": "4-4a", "csv_uri":"…", "bbox":[…], "page":58 } ],
+  "derived_tags": ["class:1,2,3","topic:hardware-sequence"]
+}
+
+{
+  "doc_id": "IPC-A-610J",
+  "sections": [{
+    "sid": "4.1.3",
+    "title": "Hardware Installation — Component Mounting — High Power",
+    "text": "…",
+    "pages": [58,59],
+    "figures": [{
+      "fid": "4-4",
+      "caption": "Figure 4-4",
+      "status": "Acceptable",
+      "image_uri": "s3://…/fig_4-4.png",
+      "bbox": [x,y,w,h],            // page coordinates (PDF user space)
+      "hotspots": [
+        {"label":"1","text":"Metal","bbox":[…]},
+        {"label":"2","text":"Terminal Lug","bbox":[…]}
+      ],
+      "legend": ["1. Metal", "2. Terminal Lug", …]
+    }]
+  }],
+  "tables": [ { "tid": "4-4a", "csv_uri":"…", "bbox":[…], "page":58 } ],
+  "derived_tags": ["class:1,2,3","topic:hardware-sequence"]
+}
+
+I think a good place to start is extracting the images and labeling them by their figure #, Figure and Table
+
+----------plan----------
+Here’s a concise recap of the custom method I proposed, including the tools and libraries to use for each step.
+
+🔧 Overall Goal
+
+Parse technical manual pages (like your screenshot) into a structured JSON:
+
+Identify sections, figures, tables.
+
+Extract captions, legends, and statuses.
+
+Detect figure “hotspots” (numbered callouts).
+
+Preserve bounding boxes in PDF user-space coordinates.
+
+Optionally crop images and save assets to S3.
+
+🧭 Step-by-Step Pipeline (with tools)
+1. Load & Represent Pages
+
+Goal: Get raw text, bounding boxes, and embedded images.
+Tools:
+
+PyMuPDF (fitz)
+ — extract text spans, images, and geometry from PDF.
+
+If only screenshots: use OpenCV or PIL to load the image and record pixel coordinates.
+
+2. Layout Detection (regions like figure, caption, sidebar, table, text)
+
+Goal: Identify visual blocks: captions, figures, legends, etc.
+Tools:
+
+layoutparser
+ + Detectron2 model (PubLayNet or DocLayNet):
+
+layout = lp.Detectron2LayoutModel('lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config')
+
+
+Alternative lightweight option: docTR
+ for OCR + layout in one pass.
+
+Each block → {"type": "figure|caption|text|table|header", "bbox": [...]}
+
+3. OCR (for text extraction in each block)
+
+Goal: Get readable text from each region.
+Tools:
+
+PaddleOCR
+ — strong at multi-language and small fonts.
+
+docTR
+ — end-to-end OCR alternative.
+
+Optionally fallback to Tesseract (pytesseract) for simple cases.
+
+4. Section Extraction
+
+Goal: Find the section ID and title.
+Regex pattern:
+
+^(\d+\.\d+(\.\d+)*)\s+(.*)
+
+
+Example: "4.1.3 Hardware Installation — Component Mounting — High Power"
+
+Store as:
+
+{"sid": "4.1.3", "title": "Hardware Installation — Component Mounting — High Power"}
+
+5. Figure + Caption Association
+
+Goal: Match figure images with their captions.
+Heuristics:
+
+Find “Figure X-Y” text blocks (^Figure\s+\d+-\d+).
+
+Associate with the nearest image block below or above it.
+
+Extract status (“Acceptable—Class 1,2,3”) from nearby sidebar text.
+
+6. Legend Extraction
+
+Goal: Extract the numbered item list beside or below the figure.
+Regex:
+
+^\s*(\d+)[\.\)]\s+(.*)$
+
+
+Output:
+
+"legend": ["1. Metal", "2. Terminal Lug", ...]
+
+
+Also build a quick map { "1": "Metal", ... } for hotspot linking.
+
+7. Hotspot Detection (numbers in the diagram)
+
+Goal: Find and label the small number markers inside the figure image.
+Tools:
+
+OpenCV for contour-based detection:
+
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                               cv2.THRESH_BINARY_INV, 15, 10)
+contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+
+Then filter for circular shapes, OCR the inside digits.
+
+OCR: PaddleOCR again (crop small regions).
+
+Optionally train YOLOv8-n on ~200 labeled callout examples for robust hotspot detection.
+
+Output Example:
+
+"hotspots": [
+  {"label": "1", "text": "Metal", "bbox": [100,200,20,20]},
+  {"label": "2", "text": "Terminal Lug", "bbox": [160,230,18,18]}
+]
+
+8. Tables
+
+Goal: Detect and extract tabular data.
+Tools:
+
+PDF: Camelot
+ or Tabula
+.
+
+Images: CascadeTabNet model (for visual table detection) + OCR.
+
+Save as CSV → upload to S3 if needed.
+
+9. Derived Tags
+
+Goal: Automatically summarize classes/topics.
+Methods:
+
+Regex & keyword rules:
+
+“Class 1,2,3” → class:1,2,3
+
+“Hardware Installation” → topic:hardware-sequence
+
+Optionally use a small LLM call for more semantic tagging.
+
+10. Assemble JSON
+
+Everything flows into a schema like:
+
+{
+  "doc_id": "IPC-A-610U",
+  "sections": [
+    {
+      "sid": "4.1.3",
+      "title": "Hardware Installation — Component Mounting — High Power",
+      "pages": [58,59],
+      "figures": [
+        {
+          "fid": "4-4",
+          "caption": "Figure 4-4",
+          "status": "Acceptable — Class 1,2,3",
+          "bbox": [...],
+          "image_uri": "s3://.../fig_4-4.png",
+          "legend": ["1. Metal", "2. Terminal Lug"],
+          "hotspots": [
+            {"label": "1", "text": "Metal", "bbox": [...]},
+            {"label": "2", "text": "Terminal Lug", "bbox": [...]}
+          ]
+        }
+      ]
+    }
+  ],
+  "tables": [
+    {"tid": "4-4a", "csv_uri": "s3://.../tbl_4-4a.csv", "bbox": [...], "page": 58}
+  ],
+  "derived_tags": ["class:1,2,3", "topic:hardware-sequence"]
+}
+
+🧩 Library Summary
+Purpose	Library
+PDF text, image, geometry	PyMuPDF (fitz)
+Page segmentation	layoutparser + Detectron2, or docTR
+OCR	PaddleOCR (preferred) or Tesseract
+Figure–caption logic, regex	re, custom heuristics
+Hotspot detection	OpenCV, PaddleOCR, optional YOLOv8
+Table extraction	Camelot / Tabula (PDF), or CascadeTabNet (image)
+Data modeling	Pydantic, json
+Storage	boto3 (for S3)
+Semantic tagging	regex + optional LLM
+
+----------chat link----------
+https://chatgpt.com/share/68f8e6f9-6450-800f-b53f-5549b8b0b707
