@@ -92,18 +92,20 @@ def load_image_page(image_path: str) -> PageRep:
     )
 
 if __name__ == "__main__":
-    pdf_path = "1-7/4.0/IPC_0018_SCH.pdf"
-    rep = load_pdf_page(pdf_path, page_number=0)
+    pdf_path = r"1-7/4.0/IPC_0018_SCH.pdf"
+    page_no = 0
 
+    rep = load_pdf_page(pdf_path, page_number=page_no)
+
+    # PASS pdf_path + page_number so detect_layout will save figure crops
     from layout_detect import detect_layout
-    layout = detect_layout(rep)
+    layout = detect_layout(rep, pdf_path=pdf_path, page_number=page_no)
 
+    # Optional: build figure objects from the layout (uses figure_candidates)
     from figure_association import associate_figures
     figures = associate_figures(layout)
 
-    # --- NEW: save figure crops ---
-    from figure_saver import save_figures_from_pdf
-    figures = save_figures_from_pdf(pdf_path, rep.page_number, figures, out_dir="figures")
-
     from pprint import pprint
     pprint(figures)
+    # show where crops were saved by detect_layout
+    print("saved crops:", [fc.get("image_uri") for fc in layout.get("figure_candidates", [])])

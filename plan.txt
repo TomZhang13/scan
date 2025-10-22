@@ -244,3 +244,22 @@ Semantic tagging	regex + optional LLM
 
 ----------chat link----------
 https://chatgpt.com/share/68f8e6f9-6450-800f-b53f-5549b8b0b707
+
+----------Ridika----------
+you need to move the folder 1-7 to this directory
+can work on steps 3, 4, 6-
+
+----------flow----------
+first_step_loader -> layout_detect -> figure_association
+
+----------steps (check above for full plan)----------
+1. Load & Represent Pages (done, first_step_loader)
+2. Layout Detection (regions like figure, caption, sidebar, table, text) (done, layout_detect)
+3. OCR (for text extraction in each block)
+4. Section Extraction
+5. Figure + Caption Association (done, figure_associationm figure_saver)
+6. Legend Extraction
+7. Hotspot Detection (numbers in the diagram)
+8. Tables
+9. Derived Tags
+10. Assemble JSON
