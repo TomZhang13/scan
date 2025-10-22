@@ -223,6 +223,81 @@ def _save_figure_crops(pdf_path: str,
     doc.close()
 
 
+import os, io, json
+from PIL import Image, ImageDraw
+
+def _save_layout_assets(pdf_path: str,
+                        page_number: int,
+                        layout: Dict[str, Any],
+                        out_dir: str = "layouts",
+                        dpi: int = 150) -> None:
+    import os, io, json
+    from PIL import Image, ImageDraw
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # --- name files by the PDF's basename ---
+    pdf_stem = os.path.splitext(os.path.basename(pdf_path))[0]
+    json_path = os.path.join(out_dir, f"{pdf_stem}_p{page_number:03d}.json")
+    png_path  = os.path.join(out_dir, f"{pdf_stem}_p{page_number:03d}.png")
+
+    # Save JSON
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(layout, f, ensure_ascii=False, indent=2)
+
+    # Render page
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(page_number)
+    page_w, page_h = page.rect.width, page.rect.height
+    pix = page.get_pixmap(dpi=dpi)
+    doc.close()
+
+    # PIL image
+    img_bytes = pix.tobytes("png")
+    base = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+    draw = ImageDraw.Draw(base)
+
+    # PDF user-space -> pixel scale
+    sx = base.width / page_w
+    sy = base.height / page_h
+
+    def to_px(bbox):
+        x0, y0, x1, y1 = bbox
+        return (x0 * sx, y0 * sy, x1 * sx, y1 * sy)
+
+    COLORS = {
+        "caption": (0, 122, 255, 255),
+        "legend_item": (255, 149, 0, 255),
+        "status": (175, 82, 222, 255),
+        "section_header": (52, 199, 89, 255),
+        "body_text": (142, 142, 147, 180),
+        "figure_candidate": (255, 59, 48, 255),
+        "figure_candidate_cv": (255, 59, 48, 255),
+        "figure_candidate_cv_matched": (255, 59, 48, 255),
+        # include if you added the synth fallback:
+        "figure_candidate_synth": (255, 204, 0, 255),
+    }
+
+    # Draw text blocks
+    for b in layout["blocks"]:
+        box = to_px(b["bbox"])
+        color = COLORS.get(b["type"], (142, 142, 147, 180))
+        draw.rectangle(box, outline=color, width=3)
+        x0, y0, *_ = box
+        draw.text((x0 + 3, y0 + 3), b["type"], fill=color)
+
+    # Draw figure candidates
+    for fc in layout["figure_candidates"]:
+        box = to_px(fc["bbox"])
+        color = COLORS.get(fc.get("type"), (255, 59, 48, 255))
+        draw.rectangle(box, outline=color, width=4)
+        x0, y0, *_ = box
+        draw.text((x0 + 3, y0 + 3), fc.get("type", "figure_candidate"), fill=color)
+
+    # Save PNG overlay
+    base.save(png_path)
+
+
 def detect_layout(
     rep: PageRep,
     *,
@@ -322,10 +397,14 @@ def detect_layout(
     result = {
         "page_number": rep.page_number,
         "page_size": (rep.width, rep.height),
-        "blocks": kept_blocks,                     # filtered: no text inside figures
-        "figure_candidates": figure_candidates,    # each may include "image_uri"
-        # "removed_text_blocks": removed_inside,   # (optional: uncomment for debugging)
+        "blocks": kept_blocks,                  # (already filtered of text inside figures)
+        "figure_candidates": figure_candidates, # may include "image_uri"
     }
+
+    # --- ALWAYS save layout assets when we have the inputs ---
+    if pdf_path is not None and page_number is not None:
+        _save_layout_assets(pdf_path, page_number, result, out_dir="layouts", dpi=150)
+
     return result
 
 
