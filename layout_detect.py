@@ -375,17 +375,19 @@ def _ocr_text_blocks(pdf_path: str,
     prep = cv2.addWeighted(clahe, 1.5, blur, -0.5, 0)
 
     # ---- tunables (adjust via env if needed) ----
+    # ---- tunables (balanced defaults; can override via env) ----
     import os
-    MIN_WORD_CONF = int(os.getenv("MIN_WORD_CONF", "72"))  # word-level confidence
-    MIN_WORD_W_PX = int(os.getenv("MIN_WORD_W_PX", "6"))   # reject super skinny specks
-    MIN_WORD_H_PX = int(os.getenv("MIN_WORD_H_PX", "8"))   # reject very short blobs
-    MAX_WORD_H_FRAC = float(os.getenv("MAX_WORD_H_FRAC", "0.10"))  # ignore ultra-tall blobs
+    MIN_WORD_CONF = int(os.getenv("MIN_WORD_CONF", "66"))   # was 72
+    MIN_WORD_W_PX = int(os.getenv("MIN_WORD_W_PX", "5"))    # was 6
+    MIN_WORD_H_PX = int(os.getenv("MIN_WORD_H_PX", "7"))    # was 8
+    MAX_WORD_H_FRAC = float(os.getenv("MAX_WORD_H_FRAC", "0.15"))  # was 0.10
 
-    MIN_SEG_H_PX = int(os.getenv("MIN_SEG_H_PX", "10"))
-    MIN_SEG_AREA_FRAC = float(os.getenv("MIN_SEG_AREA_FRAC", "2.0e-5"))  # bbox area vs page
-    MIN_SEG_CHARS = int(os.getenv("MIN_SEG_CHARS", "3"))
-    MIN_CHARS_PER_PX = float(os.getenv("MIN_CHARS_PER_PX", "0.008"))  # text density
-    MIN_SEG_MEDIAN_CONF = int(os.getenv("MIN_SEG_MEDIAN_CONF", "70"))
+    MIN_SEG_H_PX = int(os.getenv("MIN_SEG_H_PX", "8"))      # was 10
+    MIN_SEG_AREA_FRAC = float(os.getenv("MIN_SEG_AREA_FRAC", "1.0e-5"))  # was 2.0e-5
+    MIN_SEG_CHARS = int(os.getenv("MIN_SEG_CHARS", "3"))    # unchanged
+    MIN_CHARS_PER_PX = float(os.getenv("MIN_CHARS_PER_PX", "0.006"))      # was 0.008
+    MIN_SEG_MEDIAN_CONF = int(os.getenv("MIN_SEG_MEDIAN_CONF", "64"))     # was 70
+
 
     # helper: run one tess pass and return segments
     def ocr_pass(psm: int, min_conf: int) -> List[Dict[str, Any]]:
@@ -488,8 +490,9 @@ def _ocr_text_blocks(pdf_path: str,
         return segs
 
     # run two passes; slightly different base thresholds
-    segs_6 = ocr_pass(psm=6, min_conf=max(MIN_WORD_CONF, 70))  # uniform block
-    segs_4 = ocr_pass(psm=4, min_conf=max(MIN_WORD_CONF - 5, 65))  # variable block
+    # run two passes with slightly softer gates
+    segs_6 = ocr_pass(psm=6, min_conf=max(MIN_WORD_CONF, 66))
+    segs_4 = ocr_pass(psm=4, min_conf=max(MIN_WORD_CONF - 6, 60))
 
     # dedupe merged segments (keep longer text or larger area)
     def iou(a, b):
