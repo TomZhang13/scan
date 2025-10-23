@@ -174,9 +174,19 @@ def _save_figure_crops(pdf_path: str,
                        *,
                        text_blocks_for_masks: List[Dict[str, Any]],
                        out_dir: str = "figures",
-                       dpi: int = 150) -> None:
-    """Crop each candidate bbox, remove any text rectangles inside, and save."""
+                       dpi: int = 150,
+                       erase_text: bool = False,
+                       max_mask_frac: float = 0.06,    # hard safety cap: 6% of crop area
+                       dilate_kernel: int = 3,
+                       inpaint_radius: int = 2,
+                       debug_masks: bool = False) -> None:
+    """
+    Crop each candidate bbox and (optionally) inpaint tiny text rectangles inside.
+    Inpainting is OFF by default to avoid smearing figures.
+    """
+    import os
     os.makedirs(out_dir, exist_ok=True)
+
     doc = fitz.open(pdf_path)
     page = doc.load_page(page_number)
 
@@ -192,29 +202,61 @@ def _save_figure_crops(pdf_path: str,
         arr = np.frombuffer(img_bytes, np.uint8)
         crop = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         H, W = crop.shape[:2]
+        fig_area = float(W * H)
 
-        # PDF→px scales for this crop
+        # PDF→px scale for this crop
         sx = W / rect.width
         sy = H / rect.height
 
-        # build mask from provided text blocks that overlap this figure
+        # Build mask only if erase_text requested
         mask = np.zeros((H, W), dtype=np.uint8)
-        for tb in text_blocks_for_masks:
-            tbbox = tuple(tb["bbox"])
-            if _ioa_block_in_fig(tbbox, bbox) < 0.5:
-                continue
-            bx0, by0, bx1, by1 = tbbox
-            px0 = int(np.clip((bx0 - rect.x0) * sx, 0, W))
-            py0 = int(np.clip((by0 - rect.y0) * sy, 0, H))
-            px1 = int(np.clip((bx1 - rect.x0) * sx, 0, W))
-            py1 = int(np.clip((by1 - rect.y0) * sy, 0, H))
-            if px1 - px0 > 2 and py1 - py0 > 2:
+        if erase_text and text_blocks_for_masks:
+            for tb in text_blocks_for_masks:
+                tbbox = tuple(tb["bbox"])
+                # only consider blocks that are clearly inside this figure
+                if _ioa_block_in_fig(tbbox, bbox) < 0.5:
+                    continue
+
+                bx0, by0, bx1, by1 = tbbox
+                px0 = int(np.clip((bx0 - rect.x0) * sx, 0, W))
+                py0 = int(np.clip((by0 - rect.y0) * sy, 0, H))
+                px1 = int(np.clip((bx1 - rect.x0) * sx, 0, W))
+                py1 = int(np.clip((by1 - rect.y0) * sy, 0, H))
+                w = px1 - px0
+                h = py1 - py0
+                if w <= 2 or h <= 2:
+                    continue
+
+                # extra guards: keep only "text-like" small, skinny rectangles
+                #   - small area vs. figure
+                #   - short-ish height vs. figure
+                #   - reasonable aspect ratio
+                area_frac = (w * h) / max(1.0, fig_area)
+                if area_frac > 0.02:          # skip blocks larger than 2% of the figure
+                    continue
+                if h > 0.12 * H:              # skip tall boxes
+                    continue
+                if w < 10:                    # too thin to be meaningful
+                    continue
+
                 mask[py0:py1, px0:px1] = 255
 
-        if np.any(mask):
-            mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), 1)
-            crop = cv2.inpaint(crop, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+            if np.any(mask):
+                # small dilate to connect characters
+                if dilate_kernel > 1:
+                    mask = cv2.dilate(mask, np.ones((dilate_kernel, dilate_kernel), np.uint8), 1)
 
+                mask_frac = float(np.count_nonzero(mask)) / fig_area
+
+                # only inpaint if the mask is small enough (prevents visible smears)
+                if mask_frac <= max_mask_frac:
+                    crop = cv2.inpaint(crop, mask, inpaint_radius, flags=cv2.INPAINT_TELEA)
+                else:
+                    if debug_masks:
+                        fid_dbg = _extract_fid(cand.get("caption_text"), f"p{page_number+1}_{i+1}")
+                        cv2.imwrite(os.path.join(out_dir, f"mask_too_big_{fid_dbg}.png"), mask)
+
+        # save file
         fid = _extract_fid(cand.get("caption_text"), f"p{page_number+1}_{i+1}")
         out_path = os.path.join(out_dir, f"fig_{fid}.png")
         n = 2
@@ -306,8 +348,11 @@ def _ocr_text_blocks(pdf_path: str,
                      page_h: float,
                      dpi: int = 400) -> List[Dict[str, Any]]:
     """
-    OCR with robust preprocessing + dual-pass (psm 6 & psm 4), word-level grouping,
-    line splitting by large gaps, and deduping. Returns [{'text', 'bbox'}] in PDF space.
+    OCR with stronger junk suppression:
+      - require higher word confidence
+      - ignore very small/skinny words (edge/holes speckles)
+      - per-segment density/area/height/median-conf filters
+    Returns [{'text', 'bbox'}] in PDF space.
     """
     if pytesseract is None:
         return []
@@ -321,14 +366,27 @@ def _ocr_text_blocks(pdf_path: str,
     img_bgr = cv2.imdecode(np.frombuffer(pix.tobytes("png"), np.uint8), cv2.IMREAD_COLOR)
     H, W = img_bgr.shape[:2]
 
-    # --- preprocessing: grayscale -> CLAHE -> light sharpen ---
+    # --- preprocessing: grayscale -> CLAHE -> light sharpen (same as before) ---
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
     blur = cv2.GaussianBlur(clahe, ksize=(0, 0), sigmaX=0.8)
     prep = cv2.addWeighted(clahe, 1.5, blur, -0.5, 0)
 
+    # ---- tunables (adjust via env if needed) ----
+    import os
+    MIN_WORD_CONF = int(os.getenv("MIN_WORD_CONF", "72"))  # word-level confidence
+    MIN_WORD_W_PX = int(os.getenv("MIN_WORD_W_PX", "6"))   # reject super skinny specks
+    MIN_WORD_H_PX = int(os.getenv("MIN_WORD_H_PX", "8"))   # reject very short blobs
+    MAX_WORD_H_FRAC = float(os.getenv("MAX_WORD_H_FRAC", "0.10"))  # ignore ultra-tall blobs
+
+    MIN_SEG_H_PX = int(os.getenv("MIN_SEG_H_PX", "10"))
+    MIN_SEG_AREA_FRAC = float(os.getenv("MIN_SEG_AREA_FRAC", "2.0e-5"))  # bbox area vs page
+    MIN_SEG_CHARS = int(os.getenv("MIN_SEG_CHARS", "3"))
+    MIN_CHARS_PER_PX = float(os.getenv("MIN_CHARS_PER_PX", "0.008"))  # text density
+    MIN_SEG_MEDIAN_CONF = int(os.getenv("MIN_SEG_MEDIAN_CONF", "70"))
+
     # helper: run one tess pass and return segments
-    def ocr_pass(psm: int, min_conf: int = 60) -> List[Dict[str, Any]]:
+    def ocr_pass(psm: int, min_conf: int) -> List[Dict[str, Any]]:
         data = pytesseract.image_to_data(
             prep,
             output_type=pytesseract.Output.DICT,
@@ -336,25 +394,36 @@ def _ocr_text_blocks(pdf_path: str,
         )
         n = len(data["text"])
 
-        # group words by (block, paragraph, line) within this pass
+        # group words by (block, paragraph, line)
         from collections import defaultdict
         lines = defaultdict(list)
         for i in range(n):
             txt = (data["text"][i] or "").strip()
 
+            # parse conf; tesseract can emit -1 or strings
             conf_raw = data["conf"][i]
             try:
                 conf = int(float(conf_raw))
             except (ValueError, TypeError):
                 conf = -1
 
-            # keep slightly lower-conf if it looks like real text
-            if not txt or (conf < min_conf and not re.search(r"[A-Za-z0-9]", txt)):
+            if not txt:
+                continue
+            # reject punctuation-only fragments early
+            if re.fullmatch(r"[\W_]+", txt):
+                continue
+            # hard confidence gate for words (previously we allowed low-conf w/ alnum)
+            if conf < min_conf:
                 continue
 
-            l, t, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+            w = int(data["width"][i]); h = int(data["height"][i])
+            # kill tiny specks and ultra-tall blobs (edges/holes)
+            if w < MIN_WORD_W_PX or h < MIN_WORD_H_PX or (h > MAX_WORD_H_FRAC * H):
+                continue
+
+            l = int(data["left"][i]); t = int(data["top"][i])
             key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-            lines[key].append({"text": txt, "x0": l, "y0": t, "x1": l + w, "y1": t + h})
+            lines[key].append({"text": txt, "x0": l, "y0": t, "x1": l + w, "y1": t + h, "conf": conf})
 
         # pixel → PDF scaling
         sx = page_w / float(W)
@@ -384,22 +453,41 @@ def _ocr_text_blocks(pdf_path: str,
                     cur.append(curr)
             segments.append(cur)
 
-            # emit segments
+            # emit filtered segments
             for seg in segments:
                 text = " ".join(w["text"] for w in seg).strip()
                 if not text:
                     continue
-                x0 = min(w["x0"] for w in seg); y0 = min(w()["y0"] for w in seg) if False else min(w["y0"] for w in seg)
+
+                x0 = min(w["x0"] for w in seg); y0 = min(w["y0"] for w in seg)
                 x1 = max(w["x1"] for w in seg); y1 = max(w["y1"] for w in seg)
+                bw = max(1, x1 - x0); bh = max(1, y1 - y0)
+                area_frac = (bw * bh) / float(W * H)
+
+                # segment-level rejections: too small, too short, too sparse, too few chars
+                if bh < MIN_SEG_H_PX:
+                    continue
+                if area_frac < MIN_SEG_AREA_FRAC:
+                    continue
+                if len(text) < MIN_SEG_CHARS and not re.search(r"[A-Za-z]{2,}|[0-9]{2,}", text):
+                    continue
+                if (len(text) / float(bw)) < MIN_CHARS_PER_PX:
+                    continue
+
+                # require reasonable median confidence across words in the segment
+                median_conf = float(np.median([w["conf"] for w in seg]))
+                if median_conf < MIN_SEG_MEDIAN_CONF:
+                    continue
+
                 segs.append({
                     "text": text,
                     "bbox": (x0 * sx, y0 * sy, x1 * sx, y1 * sy),
                 })
         return segs
 
-    # two passes help recover stubborn lines
-    segs_6 = ocr_pass(psm=6, min_conf=60)   # uniform block
-    segs_4 = ocr_pass(psm=4, min_conf=60)   # block of text, variable size
+    # run two passes; slightly different base thresholds
+    segs_6 = ocr_pass(psm=6, min_conf=max(MIN_WORD_CONF, 70))  # uniform block
+    segs_4 = ocr_pass(psm=4, min_conf=max(MIN_WORD_CONF - 5, 65))  # variable block
 
     # dedupe merged segments (keep longer text or larger area)
     def iou(a, b):
@@ -413,9 +501,10 @@ def _ocr_text_blocks(pdf_path: str,
 
     merged: List[Dict[str, Any]] = []
     candidates = segs_6 + segs_4
-    # prioritize longer strings (more informative) then larger area
-    candidates.sort(key=lambda s: (len(s["text"]), (s["bbox"][2]-s["bbox"][0])*(s["bbox"][3]-s["bbox"][1])), reverse=True)
-
+    candidates.sort(
+        key=lambda s: (len(s["text"]), (s["bbox"][2]-s["bbox"][0])*(s["bbox"][3]-s["bbox"][1])),
+        reverse=True
+    )
     for seg in candidates:
         if all(iou(seg["bbox"], m["bbox"]) < 0.55 for m in merged):
             merged.append(seg)
@@ -524,10 +613,13 @@ def detect_layout(
 
     # --- Save figure crops (erase text inside figures) ---
     if pdf_path is not None and page_number is not None and figure_candidates:
+        # Inpainting is off by default; enable with env ERASE_FIG_TEXT=1 if desired.
+        _do_erase = os.getenv("ERASE_FIG_TEXT", "0").lower() in {"1", "true", "yes", "on"}
         _save_figure_crops(
             pdf_path, page_number, figure_candidates,
-            text_blocks_for_masks=removed_inside,  # use the ones we just removed
-            out_dir="figures", dpi=150
+            text_blocks_for_masks=removed_inside,
+            out_dir="figures", dpi=150,
+            erase_text=_do_erase
         )
 
     result = {
