@@ -315,14 +315,22 @@ def _detect_fig_rects_via_cv(
     # --- contours ---
     cnts, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-    # ADAPTIVE GATES (was: area >= 1.5%, w/h >= 120px, aspect 0.55..2.8)
-    min_area = 0.005 * page_area_px          # 0.5% of page (down from 1.5%)
-    max_area = 0.75 * page_area_px           # keep generous upper bound
-    min_dim_px = max(64, int(0.018 * min(W, H)))  # ~1.8% of min page dim or 64px
+    # ADAPTIVE GATES (looser defaults; override via env if needed)
+    import os
+    min_area_frac = float(os.getenv("FIG_MIN_AREA_FRAC", "0.003"))  # was 0.005
+    max_area_frac = float(os.getenv("FIG_MAX_AREA_FRAC", "0.85"))   # was 0.75
+    min_dim_frac  = float(os.getenv("FIG_MIN_DIM_FRAC",  "0.014"))  # was ~0.018
+    min_ar        = float(os.getenv("FIG_MIN_AR",        "0.25"))   # was 0.40
+    max_ar        = float(os.getenv("FIG_MAX_AR",        "6.50"))   # was 4.50
+    pad_frac      = float(os.getenv("FIG_PAD_FRAC",      "0.004"))  # was 0.006
+
+    min_area = min_area_frac * page_area_px
+    max_area = max_area_frac * page_area_px
+    min_dim_px = max(48, int(min_dim_frac * min(W, H)))             # was max(64, ...)
     min_ar, max_ar = 0.40, 4.50              # widen allowed aspect range
 
     cand_px: List[Tuple[int, int, int, int]] = []
-    pad_from_edge = max(8, int(0.006 * min(W, H)))  # was fixed 15px
+    pad_from_edge = max(5, int(pad_frac * min(W, H)))                # was max(8, ...)
 
     for c in cnts:
         x, y, w, h = cv2.boundingRect(c)
@@ -569,45 +577,51 @@ def detect_layout(
         if a < 0.70 * page_area:  # ignore giant background image
             figure_candidates.append({"type": "figure_candidate", "bbox": ib.bbox})
 
-    # --- NEW: CV-based detection if none were found and we have the PDF path ---
-    if not figure_candidates and pdf_path is not None and page_number is not None:
+    # --- CV-based detection if none were found and we have the PDF path ---
+    # --- CV-based detection (ALWAYS run and merge), then match to captions ---
+    if pdf_path is not None and page_number is not None:
         rects = _detect_fig_rects_via_cv(pdf_path, page_number, rep.width, rep.height, dpi=150)
 
         captions = [b for b in labeled if b.type == "caption"]
-        used: List[Tuple[float,float,float,float]] = []
+        # seed 'used' with any existing figure candidates (from embedded images)
+        used: List[Tuple[float, float, float, float]] = [tuple(fc["bbox"]) for fc in figure_candidates]
 
         for cap in captions:
             x0, y0, x1, y1 = cap.bbox
 
-            # expand caption x-range generously to the right (figures are wider)
-            exp_left  = max(0.0, x0 - 40.0)
-            exp_right = min(rep.width, x1 + 220.0)
+            # widen the horizontal band we consider for this caption
+            exp_left  = max(0.0, x0 - 60.0)          # was 40.0
+            exp_right = min(rep.width, x1 + 320.0)   # was 220.0
 
             cand = []
             for r in rects:
-                rx0, ry0, rx1, ry1 = r
-                # must be roughly ABOVE caption (allow a little tolerance)
-                # allow a bit more vertical slack between figure bottom and caption top
-                if ry1 > y0 + 25:
-                    continue
-                # allow narrower figures to still match their caption band
-                if _overlap_ratio_to(r, exp_left, exp_right) < 0.20:
+                # skip if this rect is basically the same as something we already have
+                if any(_iou(r, u) >= 0.60 for u in used):
                     continue
 
-                dy = y0 - ry1             # distance from figure bottom to caption top
+                rx0, ry0, rx1, ry1 = r
+
+                # figure must be roughly ABOVE the caption (allow more slack)
+                if ry1 > y0 + 60:    # was +25
+                    continue
+
+                # relax required horizontal overlap with the caption band
+                if _overlap_ratio_to(r, exp_left, exp_right) < 0.12:  # was 0.20
+                    continue
+
+                dy = y0 - ry1  # distance from figure bottom to caption top
                 cand.append((dy, r))
 
             if cand:
-                cand.sort(key=lambda t: t[0])     # closest above wins
+                cand.sort(key=lambda t: t[0])  # closest above the caption wins
                 chosen = cand[0][1]
-                # avoid duplicates if already picked
-                if all(_iou(chosen, u) < 0.6 for u in used):
-                    figure_candidates.append({
-                        "type": "figure_candidate_cv_matched",
-                        "bbox": chosen,
-                        "caption_text": cap.text
-                    })
-                    used.append(chosen)
+                figure_candidates.append({
+                    "type": "figure_candidate_cv_matched",
+                    "bbox": chosen,
+                    "caption_text": cap.text
+                })
+                used.append(chosen)
+
 
     # --- remove text blocks that lie inside any figure (so overlay won't show them) ---
     blocks_all = [b.to_dict() for b in labeled]
