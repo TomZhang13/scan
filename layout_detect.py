@@ -73,8 +73,8 @@ def _detect_fig_rects_via_cv(
     dpi: int = 150,
 ) -> List[Tuple[float, float, float, float]]:
     """
-    Render the page, detect large thin rectangular frames (figure borders),
-    and return their bboxes in PDF user-space coordinates.
+    Render the page, detect rectangular frames, and return bboxes in PDF space.
+    Adaptively gates min size/aspect so short figures aren't dropped.
     """
     # --- render page to PNG ---
     doc = fitz.open(pdf_path)
@@ -84,14 +84,13 @@ def _detect_fig_rects_via_cv(
     doc.close()
 
     # PNG -> numpy (BGR)
-    import numpy as np, cv2
     data = np.frombuffer(img_bytes, dtype=np.uint8)
     img = cv2.imdecode(data, cv2.IMREAD_COLOR)
     H, W = img.shape[:2]
+    page_area_px = W * H
 
-    # --- edge map that likes thin black borders ---
+    # --- edges that favor thin borders ---
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # amplify contrast around dark lines
     edges = cv2.Canny(gray, 40, 120)
     edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), 1)
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE,
@@ -100,40 +99,43 @@ def _detect_fig_rects_via_cv(
     # --- contours ---
     cnts, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
+    # ADAPTIVE GATES (was: area >= 1.5%, w/h >= 120px, aspect 0.55..2.8)
+    min_area = 0.005 * page_area_px          # 0.5% of page (down from 1.5%)
+    max_area = 0.75 * page_area_px           # keep generous upper bound
+    min_dim_px = max(64, int(0.018 * min(W, H)))  # ~1.8% of min page dim or 64px
+    min_ar, max_ar = 0.40, 4.50              # widen allowed aspect range
+
     cand_px: List[Tuple[int, int, int, int]] = []
-    page_area_px = W * H
+    pad_from_edge = max(8, int(0.006 * min(W, H)))  # was fixed 15px
 
     for c in cnts:
         x, y, w, h = cv2.boundingRect(c)
         area = w * h
 
-        # size gates (looser than before)
-        if area < 0.015 * page_area_px or area > 0.70 * page_area_px:
+        if area < min_area or area > max_area:
             continue
-        if w < 120 or h < 120:
+        if w < min_dim_px or h < min_dim_px:
             continue
 
-        # rectangularity via polygon approximation
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
         if len(approx) < 4:
             continue
 
-        # figures usually not glued to page edges
-        if x < 15 or y < 15 or (x + w) > (W - 15) or (y + h) > (H - 15):
+        # avoid page borders
+        if x < pad_from_edge or y < pad_from_edge or \
+           (x + w) > (W - pad_from_edge) or (y + h) > (H - pad_from_edge):
             continue
 
-        # aspect sanity
         ar = w / float(h)
-        if not (0.55 <= ar <= 2.8):
+        if not (min_ar <= ar <= max_ar):
             continue
 
         cand_px.append((x, y, x + w, y + h))
 
-    # sort top-to-bottom, left-to-right for stability
-    cand_px.sort(key=lambda r: (r[1], r[0]))
+    cand_px.sort(key=lambda r: (r[1], r[0]))  # top-to-bottom, left-to-right
 
-    # --- convert to PDF user-space ---
+    # convert to PDF user-space
     sx = page_w / float(W)
     sy = page_h / float(H)
     rects_pdf = [(x0 * sx, y0 * sy, x1 * sx, y1 * sy) for (x0, y0, x1, y1) in cand_px]
@@ -572,11 +574,13 @@ def detect_layout(
             for r in rects:
                 rx0, ry0, rx1, ry1 = r
                 # must be roughly ABOVE caption (allow a little tolerance)
-                if ry1 > y0 + 12:        # tolerance for rasterization wobble
+                # allow a bit more vertical slack between figure bottom and caption top
+                if ry1 > y0 + 25:
                     continue
-                # need some horizontal agreement with (expanded) caption band
-                if _overlap_ratio_to(r, exp_left, exp_right) < 0.30:
+                # allow narrower figures to still match their caption band
+                if _overlap_ratio_to(r, exp_left, exp_right) < 0.20:
                     continue
+
                 dy = y0 - ry1             # distance from figure bottom to caption top
                 cand.append((dy, r))
 
