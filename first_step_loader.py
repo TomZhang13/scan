@@ -93,6 +93,7 @@ def load_image_page(image_path: str) -> PageRep:
 
 if __name__ == "__main__":
     pdf_path = r"1-7/1.0/IPC_0002_SCH.pdf"
+    pdf_path = r"1-7/4.0/IPC_0018_SCH.pdf"
     page_no = 0
 
     rep = load_pdf_page(pdf_path, page_number=page_no)

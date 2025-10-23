@@ -6,11 +6,14 @@ import re
 
 from first_step_loader import PageRep
 
-# NEW: cv2 / numpy / fitz for visual figure detection
+# cv2 / numpy / fitz for visual figure detection
 import io
 import numpy as np
 import cv2
 import fitz  # PyMuPDF
+import pytesseract
+# https://github.com/UB-Mannheim/tesseract/wiki
+pytesseract.pytesseract.tesseract_cmd = r"C:\Users\tomz\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
 
 
 # ---- Simple labeled block ----
@@ -297,6 +300,128 @@ def _save_layout_assets(pdf_path: str,
     # Save PNG overlay
     base.save(png_path)
 
+def _ocr_text_blocks(pdf_path: str,
+                     page_number: int,
+                     page_w: float,
+                     page_h: float,
+                     dpi: int = 400) -> List[Dict[str, Any]]:
+    """
+    OCR with robust preprocessing + dual-pass (psm 6 & psm 4), word-level grouping,
+    line splitting by large gaps, and deduping. Returns [{'text', 'bbox'}] in PDF space.
+    """
+    if pytesseract is None:
+        return []
+
+    # --- render page ---
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(page_number)
+    pix = page.get_pixmap(dpi=dpi)
+    doc.close()
+
+    img_bgr = cv2.imdecode(np.frombuffer(pix.tobytes("png"), np.uint8), cv2.IMREAD_COLOR)
+    H, W = img_bgr.shape[:2]
+
+    # --- preprocessing: grayscale -> CLAHE -> light sharpen ---
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+    blur = cv2.GaussianBlur(clahe, ksize=(0, 0), sigmaX=0.8)
+    prep = cv2.addWeighted(clahe, 1.5, blur, -0.5, 0)
+
+    # helper: run one tess pass and return segments
+    def ocr_pass(psm: int, min_conf: int = 60) -> List[Dict[str, Any]]:
+        data = pytesseract.image_to_data(
+            prep,
+            output_type=pytesseract.Output.DICT,
+            config=f"--oem 3 --psm {psm} -l eng"
+        )
+        n = len(data["text"])
+
+        # group words by (block, paragraph, line) within this pass
+        from collections import defaultdict
+        lines = defaultdict(list)
+        for i in range(n):
+            txt = (data["text"][i] or "").strip()
+
+            conf_raw = data["conf"][i]
+            try:
+                conf = int(float(conf_raw))
+            except (ValueError, TypeError):
+                conf = -1
+
+            # keep slightly lower-conf if it looks like real text
+            if not txt or (conf < min_conf and not re.search(r"[A-Za-z0-9]", txt)):
+                continue
+
+            l, t, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+            lines[key].append({"text": txt, "x0": l, "y0": t, "x1": l + w, "y1": t + h})
+
+        # pixel → PDF scaling
+        sx = page_w / float(W)
+        sy = page_h / float(H)
+
+        segs: List[Dict[str, Any]] = []
+        for words in lines.values():
+            if not words:
+                continue
+            words.sort(key=lambda w: w["x0"])
+
+            widths = [w["x1"] - w["x0"] for w in words]
+            med_w = float(np.median(widths)) if widths else 0.0
+            GAP_MIN_PX = 24.0
+            GAP_FACTOR = 0.8
+            gap_thresh = max(GAP_MIN_PX, GAP_FACTOR * med_w)
+
+            # split by large gaps
+            segments: List[List[Dict[str, Any]]] = []
+            cur = [words[0]]
+            for prev, curr in zip(words, words[1:]):
+                gap = curr["x0"] - prev["x1"]
+                if gap > gap_thresh:
+                    segments.append(cur)
+                    cur = [curr]
+                else:
+                    cur.append(curr)
+            segments.append(cur)
+
+            # emit segments
+            for seg in segments:
+                text = " ".join(w["text"] for w in seg).strip()
+                if not text:
+                    continue
+                x0 = min(w["x0"] for w in seg); y0 = min(w()["y0"] for w in seg) if False else min(w["y0"] for w in seg)
+                x1 = max(w["x1"] for w in seg); y1 = max(w["y1"] for w in seg)
+                segs.append({
+                    "text": text,
+                    "bbox": (x0 * sx, y0 * sy, x1 * sx, y1 * sy),
+                })
+        return segs
+
+    # two passes help recover stubborn lines
+    segs_6 = ocr_pass(psm=6, min_conf=60)   # uniform block
+    segs_4 = ocr_pass(psm=4, min_conf=60)   # block of text, variable size
+
+    # dedupe merged segments (keep longer text or larger area)
+    def iou(a, b):
+        ax0, ay0, ax1, ay1 = a; bx0, by0, bx1, by1 = b
+        iw = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+        ih = max(0.0, min(ay1, by1) - max(ay0, by0))
+        inter = iw * ih
+        aa = max(1e-6, (ax1 - ax0) * (ay1 - ay0))
+        bb = max(1e-6, (bx1 - bx0) * (by1 - by0))
+        return inter / max(1e-6, aa + bb - inter)
+
+    merged: List[Dict[str, Any]] = []
+    candidates = segs_6 + segs_4
+    # prioritize longer strings (more informative) then larger area
+    candidates.sort(key=lambda s: (len(s["text"]), (s["bbox"][2]-s["bbox"][0])*(s["bbox"][3]-s["bbox"][1])), reverse=True)
+
+    for seg in candidates:
+        if all(iou(seg["bbox"], m["bbox"]) < 0.55 for m in merged):
+            merged.append(seg)
+
+    return merged
+
 
 def detect_layout(
     rep: PageRep,
@@ -304,11 +429,21 @@ def detect_layout(
     pdf_path: Optional[str] = None,
     page_number: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Rule-based layout labeling of text blocks + figure candidates (CV fallback)."""
+    """OCR-only text labeling + figure candidates (image/CV), with figure crops + overlay saves."""
     labeled: List[LabeledBlock] = []
 
-    for tb in rep.text_blocks:
-        t = tb.text.strip()
+    # --- OCR-only text extraction ---
+    # (Requires pdf_path + page_number. If missing, no text blocks will be produced.)
+    if pdf_path is not None and page_number is not None:
+        ocr_lines = _ocr_text_blocks(pdf_path, page_number, rep.width, rep.height, dpi=300)
+    else:
+        ocr_lines = []
+
+    # Label OCR lines
+    for ol in ocr_lines:
+        t = (ol.get("text") or "").strip()
+        if not t:
+            continue
         if CAPTION_RE.match(t):
             label = "caption"
         elif LEGEND_RE.match(t):
@@ -319,7 +454,8 @@ def detect_layout(
             label = "status"
         else:
             label = "body_text"
-        labeled.append(LabeledBlock(type=label, bbox=tb.bbox, text=t))
+        labeled.append(LabeledBlock(type=label, bbox=tuple(ol["bbox"]), text=t))
+
 
     # figure candidates from embedded images (non–full-page)
     page_area = rep.width * rep.height
