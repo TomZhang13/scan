@@ -27,7 +27,15 @@ class LabeledBlock:
         return {"type": self.type, "bbox": self.bbox, "text": self.text}
 
 
-CAPTION_RE = re.compile(r"^Figure\s+\d+-\d+\b", re.IGNORECASE)
+# Allow optional trailing subfigure letter, e.g. Figure 4-27A or Figure 4-27 (A)
+CAPTION_RE = re.compile(
+    r"""^Figure\s+                 # "Figure" + spaces
+        \d+(?:-\d+)+               # 4-27 or 3-2-1 style
+        (?:\s*\(?[A-Za-z]\)?)?     # optional A/B/C with optional parentheses/space
+        (?=\s|$|[.:;,-])           # next is space/end/punctuation
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
 LEGEND_RE = re.compile(r"^\s*(\d+)[\.\)]\s+")
 SID_RE = re.compile(r"^(\d+(?:\.\d+)+)\s+")
 STATUS_RE = re.compile(r"\b(Acceptable|Target|Defect|Non[- ]?conforming)\b", re.IGNORECASE)
@@ -64,91 +72,6 @@ def _ioa_block_in_fig(block: Tuple[float,float,float,float],
     return inter / ba
 
 
-# ---------- NEW: detect rectangular figure frames via OpenCV ----------
-def _detect_fig_rects_via_cv(
-    pdf_path: str,
-    page_number: int,
-    page_w: float,
-    page_h: float,
-    dpi: int = 150,
-) -> List[Tuple[float, float, float, float]]:
-    """
-    Render the page, detect rectangular frames, and return bboxes in PDF space.
-    Adaptively gates min size/aspect so short figures aren't dropped.
-    """
-    # --- render page to PNG ---
-    doc = fitz.open(pdf_path)
-    page = doc.load_page(page_number)
-    pix = page.get_pixmap(dpi=dpi)
-    img_bytes = pix.tobytes("png")
-    doc.close()
-
-    # PNG -> numpy (BGR)
-    data = np.frombuffer(img_bytes, dtype=np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    H, W = img.shape[:2]
-    page_area_px = W * H
-
-    # --- edges that favor thin borders ---
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 40, 120)
-    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), 1)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE,
-                             cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), 1)
-
-    # --- contours ---
-    cnts, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
-    # ADAPTIVE GATES (was: area >= 1.5%, w/h >= 120px, aspect 0.55..2.8)
-    min_area = 0.005 * page_area_px          # 0.5% of page (down from 1.5%)
-    max_area = 0.75 * page_area_px           # keep generous upper bound
-    min_dim_px = max(64, int(0.018 * min(W, H)))  # ~1.8% of min page dim or 64px
-    min_ar, max_ar = 0.40, 4.50              # widen allowed aspect range
-
-    cand_px: List[Tuple[int, int, int, int]] = []
-    pad_from_edge = max(8, int(0.006 * min(W, H)))  # was fixed 15px
-
-    for c in cnts:
-        x, y, w, h = cv2.boundingRect(c)
-        area = w * h
-
-        if area < min_area or area > max_area:
-            continue
-        if w < min_dim_px or h < min_dim_px:
-            continue
-
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) < 4:
-            continue
-
-        # avoid page borders
-        if x < pad_from_edge or y < pad_from_edge or \
-           (x + w) > (W - pad_from_edge) or (y + h) > (H - pad_from_edge):
-            continue
-
-        ar = w / float(h)
-        if not (min_ar <= ar <= max_ar):
-            continue
-
-        cand_px.append((x, y, x + w, y + h))
-
-    cand_px.sort(key=lambda r: (r[1], r[0]))  # top-to-bottom, left-to-right
-
-    # convert to PDF user-space
-    sx = page_w / float(W)
-    sy = page_h / float(H)
-    rects_pdf = [(x0 * sx, y0 * sy, x1 * sx, y1 * sy) for (x0, y0, x1, y1) in cand_px]
-    return rects_pdf
-
-
-def _overlap_ratio_to(rect: Tuple[float,float,float,float], x0: float, x1: float) -> float:
-    """Return fraction of rect's width that overlaps [x0,x1]."""
-    rx0, _, rx1, _ = rect
-    inter = max(0.0, min(rx1, x1) - max(rx0, x0))
-    rw = max(1e-6, rx1 - rx0)
-    return inter / rw
-
 def _iou(a: Tuple[float,float,float,float], b: Tuple[float,float,float,float]) -> float:
     ax0, ay0, ax1, ay1 = a
     bx0, by0, bx1, by1 = b
@@ -161,14 +84,18 @@ def _iou(a: Tuple[float,float,float,float], b: Tuple[float,float,float,float]) -
 
 import os
 
-_FID_RE = re.compile(r"(\d+-\d+)")
+# Capture the numeric part and an optional trailing letter (with/without parentheses)
+_FID_RE = re.compile(r"(\d+(?:-\d+)+)\s*(?:\(?([A-Za-z])\)?)?")
 
 def _extract_fid(caption_text: str | None, fallback: str) -> str:
     if caption_text:
         m = _FID_RE.search(caption_text)
         if m:
-            return m.group(1)
+            base = m.group(1)
+            suf = m.group(2) or ""
+            return f"{base}{suf}"
     return fallback
+
 
 def _save_figure_crops(pdf_path: str,
                        page_number: int,
@@ -344,6 +271,93 @@ def _save_layout_assets(pdf_path: str,
     # Save PNG overlay
     base.save(png_path)
 
+
+def _overlap_ratio_to(rect: Tuple[float,float,float,float], x0: float, x1: float) -> float:
+    """Return fraction of rect's width that overlaps [x0,x1]."""
+    rx0, _, rx1, _ = rect
+    inter = max(0.0, min(rx1, x1) - max(rx0, x0))
+    rw = max(1e-6, rx1 - rx0)
+    return inter / rw
+
+
+# ---------- detect rectangular figure frames via OpenCV ----------
+def _detect_fig_rects_via_cv(
+    pdf_path: str,
+    page_number: int,
+    page_w: float,
+    page_h: float,
+    dpi: int = 150,
+) -> List[Tuple[float, float, float, float]]:
+    """
+    Render the page, detect rectangular frames, and return bboxes in PDF space.
+    Adaptively gates min size/aspect so short figures aren't dropped.
+    """
+    # --- render page to PNG ---
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(page_number)
+    pix = page.get_pixmap(dpi=dpi)
+    img_bytes = pix.tobytes("png")
+    doc.close()
+
+    # PNG -> numpy (BGR)
+    data = np.frombuffer(img_bytes, dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    H, W = img.shape[:2]
+    page_area_px = W * H
+
+    # --- edges that favor thin borders ---
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 40, 120)
+    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), 1)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), 1)
+
+    # --- contours ---
+    cnts, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    # ADAPTIVE GATES (was: area >= 1.5%, w/h >= 120px, aspect 0.55..2.8)
+    min_area = 0.005 * page_area_px          # 0.5% of page (down from 1.5%)
+    max_area = 0.75 * page_area_px           # keep generous upper bound
+    min_dim_px = max(64, int(0.018 * min(W, H)))  # ~1.8% of min page dim or 64px
+    min_ar, max_ar = 0.40, 4.50              # widen allowed aspect range
+
+    cand_px: List[Tuple[int, int, int, int]] = []
+    pad_from_edge = max(8, int(0.006 * min(W, H)))  # was fixed 15px
+
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        area = w * h
+
+        if area < min_area or area > max_area:
+            continue
+        if w < min_dim_px or h < min_dim_px:
+            continue
+
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) < 4:
+            continue
+
+        # avoid page borders
+        if x < pad_from_edge or y < pad_from_edge or \
+           (x + w) > (W - pad_from_edge) or (y + h) > (H - pad_from_edge):
+            continue
+
+        ar = w / float(h)
+        if not (min_ar <= ar <= max_ar):
+            continue
+
+        cand_px.append((x, y, x + w, y + h))
+
+    cand_px.sort(key=lambda r: (r[1], r[0]))  # top-to-bottom, left-to-right
+
+    # convert to PDF user-space
+    sx = page_w / float(W)
+    sy = page_h / float(H)
+    rects_pdf = [(x0 * sx, y0 * sy, x1 * sx, y1 * sy) for (x0, y0, x1, y1) in cand_px]
+    return rects_pdf
+
+
 def _ocr_text_blocks(pdf_path: str,
                      page_number: int,
                      page_w: float,
@@ -374,8 +388,7 @@ def _ocr_text_blocks(pdf_path: str,
     blur = cv2.GaussianBlur(clahe, ksize=(0, 0), sigmaX=0.8)
     prep = cv2.addWeighted(clahe, 1.5, blur, -0.5, 0)
 
-    # ---- tunables (adjust via env if needed) ----
-    # ---- tunables (balanced defaults; can override via env) ----
+    # ---- tunables (adjust via env if needed) (balanced defaults; can override via env) ----
     import os
     MIN_WORD_CONF = int(os.getenv("MIN_WORD_CONF", "66"))   # was 72
     MIN_WORD_W_PX = int(os.getenv("MIN_WORD_W_PX", "5"))    # was 6
@@ -387,7 +400,6 @@ def _ocr_text_blocks(pdf_path: str,
     MIN_SEG_CHARS = int(os.getenv("MIN_SEG_CHARS", "3"))    # unchanged
     MIN_CHARS_PER_PX = float(os.getenv("MIN_CHARS_PER_PX", "0.006"))      # was 0.008
     MIN_SEG_MEDIAN_CONF = int(os.getenv("MIN_SEG_MEDIAN_CONF", "64"))     # was 70
-
 
     # helper: run one tess pass and return segments
     def ocr_pass(psm: int, min_conf: int) -> List[Dict[str, Any]]:
@@ -489,8 +501,7 @@ def _ocr_text_blocks(pdf_path: str,
                 })
         return segs
 
-    # run two passes; slightly different base thresholds
-    # run two passes with slightly softer gates
+    # run two passes with slightly softer gates; slightly different base thresholds
     segs_6 = ocr_pass(psm=6, min_conf=max(MIN_WORD_CONF, 66))
     segs_4 = ocr_pass(psm=4, min_conf=max(MIN_WORD_CONF - 6, 60))
 
@@ -550,7 +561,6 @@ def detect_layout(
             label = "body_text"
         labeled.append(LabeledBlock(type=label, bbox=tuple(ol["bbox"]), text=t))
 
-
     # figure candidates from embedded images (non–full-page)
     page_area = rep.width * rep.height
     figure_candidates = []
@@ -598,7 +608,6 @@ def detect_layout(
                         "caption_text": cap.text
                     })
                     used.append(chosen)
-
 
     # --- remove text blocks that lie inside any figure (so overlay won't show them) ---
     blocks_all = [b.to_dict() for b in labeled]
