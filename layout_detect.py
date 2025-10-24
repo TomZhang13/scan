@@ -604,10 +604,10 @@ def _ocr_text_blocks(pdf_path: str,
                      page_h: float,
                      dpi: int = 400) -> List[Dict[str, Any]]:
     """
-    OCR with stronger junk suppression:
-      - require higher word confidence
-      - ignore very small/skinny words (edge/holes speckles)
-      - per-segment density/area/height/median-conf filters
+    OCR with stronger junk suppression + two fixes:
+      (1) Rescue leading tiny/low-conf words by being more lenient per-word and merging
+          tiny leading tokens into the main segment before short-seg filtering.
+      (2) Trim segment boxes to ink so right-edge whitespace isn't captured.
     Returns [{'text', 'bbox'}] in PDF space.
     """
     if pytesseract is None:
@@ -622,24 +622,34 @@ def _ocr_text_blocks(pdf_path: str,
     img_bgr = cv2.imdecode(np.frombuffer(pix.tobytes("png"), np.uint8), cv2.IMREAD_COLOR)
     H, W = img_bgr.shape[:2]
 
-    # --- preprocessing: grayscale -> CLAHE -> light sharpen (same as before) ---
+    # --- preprocessing: grayscale -> CLAHE -> light sharpen ---
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
     blur = cv2.GaussianBlur(clahe, ksize=(0, 0), sigmaX=0.8)
     prep = cv2.addWeighted(clahe, 1.5, blur, -0.5, 0)
 
-    # ---- tunables (adjust via env if needed) (balanced defaults; can override via env) ----
+    # ---- tunables (can override via env) ----
     import os
-    MIN_WORD_CONF = int(os.getenv("MIN_WORD_CONF", "66"))   # was 72
-    MIN_WORD_W_PX = int(os.getenv("MIN_WORD_W_PX", "5"))    # was 6
-    MIN_WORD_H_PX = int(os.getenv("MIN_WORD_H_PX", "7"))    # was 8
-    MAX_WORD_H_FRAC = float(os.getenv("MAX_WORD_H_FRAC", "0.15"))  # was 0.10
+    # Make per-word intake a bit more permissive; rely on segment median conf later
+    MIN_WORD_CONF = int(os.getenv("MIN_WORD_CONF", "58"))   # was 66
+    MIN_WORD_W_PX = int(os.getenv("MIN_WORD_W_PX", "4"))    # was 5
+    MIN_WORD_H_PX = int(os.getenv("MIN_WORD_H_PX", "6"))    # was 7
+    MAX_WORD_H_FRAC = float(os.getenv("MAX_WORD_H_FRAC", "0.15"))
 
-    MIN_SEG_H_PX = int(os.getenv("MIN_SEG_H_PX", "8"))      # was 10
-    MIN_SEG_AREA_FRAC = float(os.getenv("MIN_SEG_AREA_FRAC", "1.0e-5"))  # was 2.0e-5
-    MIN_SEG_CHARS = int(os.getenv("MIN_SEG_CHARS", "3"))    # unchanged
-    MIN_CHARS_PER_PX = float(os.getenv("MIN_CHARS_PER_PX", "0.006"))      # was 0.008
-    MIN_SEG_MEDIAN_CONF = int(os.getenv("MIN_SEG_MEDIAN_CONF", "64"))     # was 70
+    MIN_SEG_H_PX = int(os.getenv("MIN_SEG_H_PX", "8"))
+    MIN_SEG_AREA_FRAC = float(os.getenv("MIN_SEG_AREA_FRAC", "1.0e-5"))
+    MIN_SEG_CHARS = int(os.getenv("MIN_SEG_CHARS", "3"))
+    MIN_CHARS_PER_PX = float(os.getenv("MIN_CHARS_PER_PX", "0.006"))
+    MIN_SEG_MEDIAN_CONF = int(os.getenv("MIN_SEG_MEDIAN_CONF", "64"))
+
+    # Ink-trim parameters (avoid big empty bands at edges)
+    INK_EMPTY_BAND_MIN = int(os.getenv("INK_EMPTY_BAND_MIN", "6"))  # px
+    INK_COL_BLACK_RATIO = float(os.getenv("INK_COL_BLACK_RATIO", "0.012"))  # % of rows
+
+    # final padding (asymmetric: keep right small so we don't hit page edge)
+    PAD_LEFT = float(os.getenv("PAD_LEFT_PX", "4.0"))
+    PAD_RIGHT = float(os.getenv("PAD_RIGHT_PX", "1.5"))
+    PAD_Y = float(os.getenv("PAD_Y_PX", "2.0"))
 
     # helper: run one tess pass and return segments
     def ocr_pass(psm: int, min_conf: int) -> List[Dict[str, Any]]:
@@ -650,42 +660,51 @@ def _ocr_text_blocks(pdf_path: str,
         )
         n = len(data["text"])
 
-        # group words by (block, paragraph, line)
         from collections import defaultdict
         lines = defaultdict(list)
-        for i in range(n):
-            txt = (data["text"][i] or "").strip()
+        all_word_w: List[int] = []
 
-            # parse conf; tesseract can emit -1 or strings
+        # --- collect words (slightly looser than before) ---
+        for i in range(n):
+            raw_txt = data["text"][i]
+            txt = (raw_txt or "").strip()
+
             conf_raw = data["conf"][i]
             try:
                 conf = int(float(conf_raw))
             except (ValueError, TypeError):
                 conf = -1
 
+            # keep low-conf punctuation-only OUT (they explode gaps)
             if not txt:
                 continue
-            # reject punctuation-only fragments early
             if re.fullmatch(r"[\W_]+", txt):
                 continue
-            # hard confidence gate for words (previously we allowed low-conf w/ alnum)
+
+            # be a bit more permissive per word;
+            # segment-level median conf will prune junk later
             if conf < min_conf:
-                continue
+                # allow *very* low-conf words only if they have reasonable size;
+                # they'll be absorbed/trimmed by segment median filter
+                if conf < (min_conf - 12):
+                    continue
 
             w = int(data["width"][i]); h = int(data["height"][i])
-            # kill tiny specks and ultra-tall blobs (edges/holes)
             if w < MIN_WORD_W_PX or h < MIN_WORD_H_PX or (h > MAX_WORD_H_FRAC * H):
                 continue
 
             l = int(data["left"][i]); t = int(data["top"][i])
             key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
             lines[key].append({"text": txt, "x0": l, "y0": t, "x1": l + w, "y1": t + h, "conf": conf})
+            all_word_w.append(w)
 
-        # pixel → PDF scaling
+        # PDF user-space scaling
         sx = page_w / float(W)
         sy = page_h / float(H)
 
-        segs: List[Dict[str, Any]] = []
+        segs_px: List[Dict[str, Any]] = []
+
+        # --- group into segments per visual line ---
         for words in lines.values():
             if not words:
                 continue
@@ -693,11 +712,13 @@ def _ocr_text_blocks(pdf_path: str,
 
             widths = [w["x1"] - w["x0"] for w in words]
             med_w = float(np.median(widths)) if widths else 0.0
-            GAP_MIN_PX = 24.0
-            GAP_FACTOR = 0.8
+
+            # tolerate curvature and small breaks
+            GAP_MIN_PX = 32.0
+            GAP_FACTOR = 1.25
             gap_thresh = max(GAP_MIN_PX, GAP_FACTOR * med_w)
 
-            # split by large gaps
+            # split by big gaps
             segments: List[List[Dict[str, Any]]] = []
             cur = [words[0]]
             for prev, curr in zip(words, words[1:]):
@@ -709,7 +730,51 @@ def _ocr_text_blocks(pdf_path: str,
                     cur.append(curr)
             segments.append(cur)
 
-            # emit filtered segments
+            # Heuristic rescue: merge a *tiny* leading token (e.g., "A", "I", "'The")
+            # into the next segment before short-segment filtering.
+            def _seg_text_len(seg: List[Dict[str, Any]]) -> int:
+                return sum(len(w["text"]) for w in seg)
+
+            if len(segments) >= 2 and _seg_text_len(segments[0]) <= 2:
+                lead = segments[0]; nxt = segments[1]
+                gap0 = nxt[0]["x0"] - lead[-1]["x1"]
+                # be generous but bounded
+                if gap0 <= (gap_thresh * 1.75):
+                    segments[1] = lead + segments[1]
+                    segments = segments[1:]
+
+            # merge neighbors on slightly curved lines (existing logic, a bit looser)
+            def _merge_segments_curvy(segs: List[List[Dict[str, Any]]],
+                                      base_gap: float,
+                                      med_w_local: float) -> List[List[Dict[str, Any]]]:
+                if not segs:
+                    return segs
+                MERGE_EXTRA = 0.55 * max(8.0, med_w_local)
+                merged: List[List[Dict[str, Any]]] = [segs[0]]
+                for nx in segs[1:]:
+                    pv = merged[-1]
+                    gap_px = nx[0]["x0"] - pv[-1]["x1"]
+
+                    px0 = min(w["x0"] for w in pv); py0 = min(w["y0"] for w in pv)
+                    px1 = max(w["x1"] for w in pv); py1 = max(w["y1"] for w in pv)
+                    nx0 = min(w["x0"] for w in nx); ny0 = min(w["y0"] for w in nx)
+                    nx1 = max(w["x1"] for w in nx); ny1 = max(w["y1"] for w in nx)
+                    ph = max(1, py1 - py0); nh = max(1, ny1 - ny0)
+
+                    v_center_diff = abs(((py0 + py1) / 2.0) - ((ny0 + ny1) / 2.0))
+                    v_tol = 0.28 * max(ph, nh)
+                    overlap_h = min(py1, ny1) - max(py0, ny0)
+                    v_overlap = overlap_h / float(max(1, min(ph, nh)))
+
+                    if (gap_px <= base_gap + MERGE_EXTRA) and (v_center_diff <= v_tol or v_overlap >= 0.55):
+                        merged[-1] = pv + nx
+                    else:
+                        merged.append(nx)
+                return merged
+
+            segments = _merge_segments_curvy(segments, gap_thresh, med_w)
+
+            # emit filtered segments (px first)
             for seg in segments:
                 text = " ".join(w["text"] for w in seg).strip()
                 if not text:
@@ -720,30 +785,100 @@ def _ocr_text_blocks(pdf_path: str,
                 bw = max(1, x1 - x0); bh = max(1, y1 - y0)
                 area_frac = (bw * bh) / float(W * H)
 
-                # segment-level rejections: too small, too short, too sparse, too few chars
                 if bh < MIN_SEG_H_PX:
                     continue
                 if area_frac < MIN_SEG_AREA_FRAC:
                     continue
                 if len(text) < MIN_SEG_CHARS and not re.search(r"[A-Za-z]{2,}|[0-9]{2,}", text):
+                    # this catches isolated 'A'/'I' *after* the rescue merge above
                     continue
                 if (len(text) / float(bw)) < MIN_CHARS_PER_PX:
                     continue
 
-                # require reasonable median confidence across words in the segment
                 median_conf = float(np.median([w["conf"] for w in seg]))
                 if median_conf < MIN_SEG_MEDIAN_CONF:
                     continue
 
-                segs.append({
+                segs_px.append({
                     "text": text,
-                    "bbox": (x0 * sx, y0 * sy, x1 * sx, y1 * sy),
+                    "bbox_px": (x0, y0, x1, y1),
+                    "h_px": bh
                 })
-        return segs
 
-    # run two passes with slightly softer gates; slightly different base thresholds
-    segs_6 = ocr_pass(psm=6, min_conf=max(MIN_WORD_CONF, 66))
-    segs_4 = ocr_pass(psm=4, min_conf=max(MIN_WORD_CONF - 6, 60))
+        # Optional: stitch across tiny Tesseract line breaks across the page
+        if segs_px:
+            g_med_w = float(np.median(all_word_w)) if all_word_w else 0.0
+            BASE_GAP = max(32.0, 1.25 * g_med_w)
+            EXTRA = 0.75 * max(8.0, g_med_w)
+
+            segs_px.sort(key=lambda s: ((s["bbox_px"][1] + s["bbox_px"][3]) / 2.0, s["bbox_px"][0]))
+            stitched = [segs_px[0]]
+            for s in segs_px[1:]:
+                prev = stitched[-1]
+                px0, py0, px1, py1 = prev["bbox_px"]
+                sx0, sy0, sx1, sy1 = s["bbox_px"]
+
+                v_overlap = max(0.0, min(py1, sy1) - max(py0, sy0)) / float(max(1.0, min(py1 - py0, sy1 - sy0)))
+                ph = max(1.0, py1 - py0); nh = max(1.0, sy1 - sy0)
+                v_cent_diff = abs((py0 + py1) / 2.0 - (sy0 + sy1) / 2.0)
+                v_tol = 0.30 * max(ph, nh)
+
+                hgap = max(0.0, sx0 - px1)
+                if (hgap <= BASE_GAP + EXTRA) and (v_overlap >= 0.55 or v_cent_diff <= v_tol):
+                    new_bbox = (min(px0, sx0), min(py0, sy0), max(px1, sx1), max(py1, sy1))
+                    prev["bbox_px"] = new_bbox
+                    prev["text"] = (prev["text"] + " " + s["text"]).strip()
+                    prev["h_px"] = max(ph, nh)
+                else:
+                    stitched.append(s)
+            segs_px = stitched
+
+        # --- helper: trim bbox to ink to avoid trailing whitespace ---
+        def _tighten_bbox_to_ink(img_gray: np.ndarray,
+                                 bbox_px: Tuple[float, float, float, float]) -> Tuple[int,int,int,int]:
+            x0, y0, x1, y1 = map(int, bbox_px)
+            x0 = max(0, x0); y0 = max(0, y0); x1 = min(img_gray.shape[1]-1, x1); y1 = min(img_gray.shape[0]-1, y1)
+            if x1 <= x0 + 1 or y1 <= y0 + 1:
+                return x0, y0, x1, y1
+            roi = img_gray[y0:y1, x0:x1]
+            # Otsu binarize then column projection
+            _, bw = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            col_sum = (bw > 0).sum(axis=0)
+            h = bw.shape[0]
+            thr = max(1, int(INK_COL_BLACK_RATIO * h))
+            nz = np.where(col_sum >= thr)[0]
+            if nz.size == 0:
+                return x0, y0, x1, y1
+            left_margin = int(nz[0])
+            right_margin = int((bw.shape[1]-1) - nz[-1])
+            if left_margin >= INK_EMPTY_BAND_MIN:
+                x0 += left_margin
+            if right_margin >= INK_EMPTY_BAND_MIN:
+                x1 -= right_margin
+            return x0, y0, x1, y1
+
+        # Final small padding after ink-trim (avoid snapping to page edge)
+        out: List[Dict[str, Any]] = []
+        for s in segs_px:
+            x0, y0, x1, y1 = s["bbox_px"]
+            # trim to ink (use preprocessed image for robustness)
+            x0, y0, x1, y1 = _tighten_bbox_to_ink(prep, (x0, y0, x1, y1))
+
+            # asymmetric padding; avoid reaching W exactly
+            x0 = max(0, int(x0 - PAD_LEFT))
+            y0 = max(0, int(y0 - PAD_Y))
+            x1 = min(W - 1, int(x1 + PAD_RIGHT))
+            y1 = min(H - 1, int(y1 + PAD_Y))
+
+            out.append({
+                "text": s["text"],
+                "bbox": (x0 * sx, y0 * sy, x1 * sx, y1 * sy),
+            })
+        return out
+
+    # run two passes with slightly softer gates
+    segs_6 = ocr_pass(psm=6, min_conf=max(MIN_WORD_CONF, 58))
+    segs_4 = ocr_pass(psm=4, min_conf=max(MIN_WORD_CONF - 6, 52))
 
     # dedupe merged segments (keep longer text or larger area)
     def iou(a, b):
@@ -930,7 +1065,7 @@ def detect_layout(
                 kept_figs.append(fc)
         figure_candidates = kept_figs
 
-    # --- remove text blocks that lie inside any figure OR table (overlay clarity) ---
+    # --- remove blocks inside tables (drop ALL types), and keep prior figure behavior ---
     blocks_all = [b.to_dict() for b in labeled]
     removed_inside: List[Dict[str, Any]] = []
     kept_blocks: List[Dict[str, Any]] = []
@@ -938,16 +1073,25 @@ def detect_layout(
     any_regions = bool(figure_candidates) or bool(table_candidates)
     if any_regions:
         for b in blocks_all:
-            t = b.get("type")
-            # only purge general text; captions/legend/status live outside figures
-            if t == "body_text":
-                inside_fig = any(_ioa_block_in_fig(tuple(b["bbox"]), tuple(fc["bbox"])) >= 0.5
-                                 for fc in figure_candidates)
-                inside_tbl = any(_ioa_block_in_fig(tuple(b["bbox"]), tuple(tc["bbox"])) >= 0.5
-                                 for tc in table_candidates)
-                if inside_fig or inside_tbl:
+            # 1) If this block sits inside ANY table region, remove it regardless of type
+            inside_tbl = any(
+                _ioa_block_in_fig(tuple(b["bbox"]), tuple(tc["bbox"])) >= 0.5
+                for tc in table_candidates
+            )
+            if inside_tbl:
+                removed_inside.append(b)
+                continue
+
+            # 2) Keep the original policy for figures: only drop body_text inside figures
+            if b.get("type") == "body_text":
+                inside_fig = any(
+                    _ioa_block_in_fig(tuple(b["bbox"]), tuple(fc["bbox"])) >= 0.5
+                    for fc in figure_candidates
+                )
+                if inside_fig:
                     removed_inside.append(b)
                     continue
+
             kept_blocks.append(b)
     else:
         kept_blocks = blocks_all
