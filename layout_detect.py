@@ -19,7 +19,7 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Users\tomz\AppData\Local\Programs\T
 # ---- Simple labeled block ----
 @dataclass
 class LabeledBlock:
-    type: str  # "caption" | "legend_item" | "status" | "section_header" | "body_text"
+    type: str  # "caption" | "table_caption" | "legend_item" | "status" | "section_header" | "body_text"
     bbox: Tuple[float, float, float, float]
     text: str
 
@@ -32,6 +32,14 @@ CAPTION_RE = re.compile(
     r"""^Figure\s+                 # "Figure" + spaces
         \d+(?:-\d+)+               # 4-27 or 3-2-1 style
         (?:\s*\(?[A-Za-z]\)?)?     # optional A/B/C with optional parentheses/space
+        (?=\s|$|[.:;,-])           # next is space/end/punctuation
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
+TABLE_CAPTION_RE = re.compile(
+    r"""^Table\s+
+        \d+(?:-\d+)+               # 1-4 or 3-2-1 style
+        (?:\s*\(?[A-Za-z]\)?)?     # optional trailing A/B with/without parentheses
         (?=\s|$|[.:;,-])           # next is space/end/punctuation
     """,
     re.IGNORECASE | re.VERBOSE
@@ -90,6 +98,17 @@ _FID_RE = re.compile(r"(\d+(?:-\d+)+)\s*(?:\(?([A-Za-z])\)?)?")
 def _extract_fid(caption_text: str | None, fallback: str) -> str:
     if caption_text:
         m = _FID_RE.search(caption_text)
+        if m:
+            base = m.group(1)
+            suf = m.group(2) or ""
+            return f"{base}{suf}"
+    return fallback
+
+# For tables we use the same id extractor (numeric groups + optional letter).
+_TID_RE = _FID_RE
+def _extract_tid(caption_text: str | None, fallback: str) -> str:
+    if caption_text:
+        m = _TID_RE.search(caption_text)
         if m:
             base = m.group(1)
             suf = m.group(2) or ""
@@ -197,6 +216,42 @@ def _save_figure_crops(pdf_path: str,
     doc.close()
 
 
+def _save_table_crops(pdf_path: str,
+                      page_number: int,
+                      candidates: List[Dict[str, Any]],
+                      *,
+                      out_dir: str = "tables",
+                      dpi: int = 150) -> None:
+    """
+    Crop and save each table bbox as PNG. No inpainting—keep grid/text intact.
+    Writes absolute path to cand['image_uri'].
+    """
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(page_number)
+
+    for i, cand in enumerate(candidates):
+        bbox = cand.get("bbox")
+        if not bbox:
+            continue
+        rect = fitz.Rect(bbox)
+        pix = page.get_pixmap(clip=rect, dpi=dpi)
+        img_bytes = pix.tobytes("png")
+        # filename by tid if present in caption
+        tid = _extract_tid(cand.get("caption_text"), f"p{page_number+1}_{i+1}")
+        out_path = os.path.join(out_dir, f"table_{tid}.png")
+        n = 2
+        while os.path.exists(out_path):
+            out_path = os.path.join(out_dir, f"table_{tid}_{n}.png"); n += 1
+        with open(out_path, "wb") as f:
+            f.write(img_bytes)
+        cand["image_uri"] = os.path.abspath(out_path)
+
+    doc.close()
+
+
 import os, io, json
 from PIL import Image, ImageDraw
 
@@ -241,6 +296,7 @@ def _save_layout_assets(pdf_path: str,
 
     COLORS = {
         "caption": (0, 122, 255, 255),
+        "table_caption": (255, 214, 10, 255),  # yellow for table captions
         "legend_item": (255, 149, 0, 255),
         "status": (175, 82, 222, 255),
         "section_header": (52, 199, 89, 255),
@@ -250,6 +306,8 @@ def _save_layout_assets(pdf_path: str,
         "figure_candidate_cv_matched": (255, 59, 48, 255),
         # include if you added the synth fallback:
         "figure_candidate_synth": (255, 204, 0, 255),
+        "table_candidate_cv": (255, 214, 10, 255),           # yellow
+        "table_candidate_cv_matched": (255, 214, 10, 255),   # yellow
     }
 
     # Draw text blocks
@@ -267,6 +325,15 @@ def _save_layout_assets(pdf_path: str,
         draw.rectangle(box, outline=color, width=4)
         x0, y0, *_ = box
         draw.text((x0 + 3, y0 + 3), fc.get("type", "figure_candidate"), fill=color)
+ 
+    # Draw table candidates
+    for tc in layout.get("table_candidates", []):
+        box = to_px(tc["bbox"])
+        color = COLORS.get(tc.get("type"), (255, 214, 10, 255))
+        draw.rectangle(box, outline=color, width=4)
+        x0, y0, *_ = box
+        tag = tc.get("type", "table_candidate")
+        draw.text((x0 + 3, y0 + 3), tag, fill=color)
 
     # Save PNG overlay
     base.save(png_path)
@@ -364,6 +431,171 @@ def _detect_fig_rects_via_cv(
     sy = page_h / float(H)
     rects_pdf = [(x0 * sx, y0 * sy, x1 * sx, y1 * sy) for (x0, y0, x1, y1) in cand_px]
     return rects_pdf
+ 
+ 
+def _nms_rects(rects_px: List[Tuple[int,int,int,int]],
+               scores: List[float],
+               iou_thresh: float = 0.6) -> List[int]:
+    """Simple NMS over pixel-space rects. Returns kept indices."""
+    if not rects_px:
+        return []
+    boxes = np.array(rects_px, dtype=np.float32)
+    scores = np.array(scores, dtype=np.float32)
+    x1, y1, x2, y2 = boxes[:,0], boxes[:,1], boxes[:,2], boxes[:,3]
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = int(order[0])
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        w = np.maximum(0.0, xx2 - xx1 + 1)
+        h = np.maximum(0.0, yy2 - yy1 + 1)
+        inter = w * h
+        ovr = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+        inds = np.where(ovr <= iou_thresh)[0]
+        order = order[inds + 1]
+    return keep
+
+
+def _detect_table_rects_via_cv(
+    pdf_path: str,
+    page_number: int,
+    page_w: float,
+    page_h: float,
+    dpi: int = 300,
+) -> List[Dict[str, Any]]:
+    """
+    Return list of table proposals as dicts:
+      { "bbox": (x0,y0,x1,y1) in PDF space, "grid_score": float, "brightness": float }
+    Approach: binarize -> extract horizontal/vertical line maps -> union -> contours -> filter -> NMS.
+    """
+    # --- render page ---
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(page_number)
+    pix = page.get_pixmap(dpi=dpi)
+    img_bytes = pix.tobytes("png")
+    doc.close()
+
+    img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+    H, W = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # --- binarize ---
+    # Slight blur to reduce speckle; Otsu threshold (invert so lines=1)
+    blur = cv2.GaussianBlur(gray, (3,3), 0)
+    _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # --- line maps ---
+    # Kernel sizes scale with page size
+    kx = max(15, W // 60)  # horizontal line length
+    ky = max(15, H // 60)  # vertical line length
+    horiz = cv2.erode(bw, cv2.getStructuringElement(cv2.MORPH_RECT, (kx, 1)), iterations=1)
+    horiz = cv2.dilate(horiz, cv2.getStructuringElement(cv2.MORPH_RECT, (kx, 1)), iterations=1)
+    vert = cv2.erode(bw, cv2.getStructuringElement(cv2.MORPH_RECT, (1, ky)), iterations=1)
+    vert = cv2.dilate(vert, cv2.getStructuringElement(cv2.MORPH_RECT, (1, ky)), iterations=1)
+
+    # union of lines; a light dilate to close tiny gaps
+    lines = cv2.bitwise_or(horiz, vert)
+    lines = cv2.dilate(lines, cv2.getStructuringElement(cv2.MORPH_RECT, (3,3)), 1)
+
+    # edges for border score (thin black frames)
+    edges = cv2.Canny(gray, 60, 160)
+
+    # --- find rect proposals on line-union ---
+    cnts, _ = cv2.findContours(lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    page_area_px = float(W * H)
+
+    import os
+    MIN_AREA_FRAC = float(os.getenv("TABLE_MIN_AREA_FRAC", "0.006"))   # tables can be sizable
+    MAX_AREA_FRAC = float(os.getenv("TABLE_MAX_AREA_FRAC", "0.85"))
+    MIN_DIM_FRAC  = float(os.getenv("TABLE_MIN_DIM_FRAC",  "0.02"))
+    MIN_AR        = float(os.getenv("TABLE_MIN_AR",        "0.35"))
+    MAX_AR        = float(os.getenv("TABLE_MAX_AR",        "8.50"))
+    PAD_FRAC      = float(os.getenv("TABLE_PAD_FRAC",      "0.004"))
+    GRID_THRESH   = float(os.getenv("TABLE_GRID_THRESH",   "0.0045"))  # keep if >=
+    BRIGHT_MIN    = float(os.getenv("TABLE_BRIGHT_MIN",    "160"))     # mean gray inside >=
+    NMS_IOU       = float(os.getenv("TABLE_NMS_IOU",       "0.60"))
+
+    pad_from_edge = max(5, int(PAD_FRAC * min(W, H)))
+    min_area = MIN_AREA_FRAC * page_area_px
+    max_area = MAX_AREA_FRAC * page_area_px
+    min_dim_px = max(32, int(MIN_DIM_FRAC * min(W, H)))
+
+    rects_px: List[Tuple[int,int,int,int]] = []
+    scores: List[float] = []
+    brights: List[float] = []
+
+    # integral images for fast box sums
+    lines_int = cv2.integral(lines // 255)
+    gray_int  = cv2.integral(gray)
+    edges_int = cv2.integral(edges // 255)
+
+    def sum_region(ii, x0, y0, x1, y1):
+        # inclusive-exclusive on integral image
+        x0c, y0c, x1c, y1c = x0, y0, x1-1, y1-1
+        return int(ii[y1c+1, x1c+1] - ii[y0c, x1c+1] - ii[y1c+1, x0c] + ii[y0c, x0c])
+
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        area = w * h
+        if area < min_area or area > max_area:
+            continue
+        if w < min_dim_px or h < min_dim_px:
+            continue
+        if x < pad_from_edge or y < pad_from_edge or (x + w) > (W - pad_from_edge) or (y + h) > (H - pad_from_edge):
+            continue
+        ar = w / float(h)
+        if not (MIN_AR <= ar <= MAX_AR):
+            continue
+
+        # gridness = line pixels density inside bbox
+        line_pix = sum_region(lines_int, x, y, x + w, y + h)
+        gridness = line_pix / float(area + 1e-6)
+        if gridness < GRID_THRESH:
+            continue
+
+        # interior brightness (mean gray)
+        gray_sum = sum_region(gray_int, x, y, x + w, y + h)
+        mean_gray = gray_sum / float(area + 1e-6)
+        if mean_gray < BRIGHT_MIN:
+            continue
+
+        # border score: edge pixels along a thin perimeter band
+        band = 2
+        per_edge = (
+            sum_region(edges_int, x, y, x + w, y + band) +
+            sum_region(edges_int, x, y + h - band, x + w, y + h) +
+            sum_region(edges_int, x, y, x + band, y + h) +
+            sum_region(edges_int, x + w - band, y, x + w, y + h)
+        ) / float(2*w + 2*h + 1e-6)
+
+        # keep; score mixes gridness and border presence
+        score = float(gridness * 0.8 + per_edge * 0.2)
+        rects_px.append((x, y, x + w, y + h))
+        scores.append(score)
+        brights.append(mean_gray)
+
+    # NMS
+    keep_idx = _nms_rects(rects_px, scores, iou_thresh=NMS_IOU)
+    rects_px = [rects_px[i] for i in keep_idx]
+    scores   = [scores[i]   for i in keep_idx]
+    brights  = [brights[i]  for i in keep_idx]
+
+    # convert to PDF
+    sx = page_w / float(W)
+    sy = page_h / float(H)
+    out = []
+    for (x0, y0, x1, y1), sc, br in zip(rects_px, scores, brights):
+        out.append({
+            "bbox": (x0 * sx, y0 * sy, x1 * sx, y1 * sy),
+            "grid_score": float(sc),
+            "brightness": float(br),
+        })
+    return out
 
 
 def _ocr_text_blocks(pdf_path: str,
@@ -559,6 +791,8 @@ def detect_layout(
             continue
         if CAPTION_RE.match(t):
             label = "caption"
+        elif TABLE_CAPTION_RE.match(t):
+            label = "table_caption"
         elif LEGEND_RE.match(t):
             label = "legend_item"
         elif SID_RE.match(t):
@@ -577,8 +811,7 @@ def detect_layout(
         if a < 0.70 * page_area:  # ignore giant background image
             figure_candidates.append({"type": "figure_candidate", "bbox": ib.bbox})
 
-    # --- CV-based detection if none were found and we have the PDF path ---
-    # --- CV-based detection (ALWAYS run and merge), then match to captions ---
+    # --- FIGURES: CV-based detection (ALWAYS run and merge), then match to captions ---
     if pdf_path is not None and page_number is not None:
         rects = _detect_fig_rects_via_cv(pdf_path, page_number, rep.width, rep.height, dpi=150)
 
@@ -623,18 +856,96 @@ def detect_layout(
                 used.append(chosen)
 
 
-    # --- remove text blocks that lie inside any figure (so overlay won't show them) ---
+    # --- TABLES: detect via CV and associate to captions (strict: keep ONLY caption-matched) ---
+    table_candidates: List[Dict[str, Any]] = []
+    removed_inside_tables: List[Dict[str, Any]] = []
+    if pdf_path is not None and page_number is not None:
+        # If no "Table ..." caption on page, skip table detection entirely to avoid false positives.
+        t_caps = [b for b in labeled if b.type == "table_caption"]
+        if t_caps:
+            proposals = _detect_table_rects_via_cv(pdf_path, page_number, rep.width, rep.height, dpi=300)
+            for p in proposals:
+                table_candidates.append({"type": "table_candidate_cv", "bbox": p["bbox"], "grid_score": p["grid_score"]})
+
+            # geometry-first association: table just below its caption, within a max vertical gap
+            import os
+            MAX_GAP = float(os.getenv("TABLE_MAX_CAPTION_GAP_PT", "160.0"))  # PDF user space points
+            used_tbl: List[Tuple[float,float,float,float]] = []
+            for cap in t_caps:
+                cx0, cy0, cx1, cy1 = cap.bbox
+                exp_left  = max(0.0, cx0 - 60.0)
+                exp_right = min(rep.width, cx1 + 320.0)
+                cand = []
+                for tc in table_candidates:
+                    if tc.get("type") != "table_candidate_cv":  # skip already matched
+                        continue
+                    tx0, ty0, tx1, ty1 = tc["bbox"]
+                    # table should start below caption (allow tiny slack)
+                    if ty0 < cy1 - 20.0:
+                        continue
+                    dy = ty0 - cy1
+                    # enforce a maximum allowed distance below the caption
+                    if dy > MAX_GAP:
+                        continue
+                    # horizontal overlap with expanded caption band
+                    if _overlap_ratio_to(tc["bbox"], exp_left, exp_right) < 0.12:
+                        continue
+                    # not already used (high IoU)
+                    if any(_iou(tc["bbox"], u) >= 0.60 for u in used_tbl):
+                        continue
+                    cand.append((dy, tc))
+                if cand:
+                    cand.sort(key=lambda t: t[0])
+                    chosen = cand[0][1]
+                    chosen["type"] = "table_candidate_cv_matched"
+                    chosen["caption_text"] = cap.text
+                    used_tbl.append(tuple(chosen["bbox"]))
+
+            # Drop ALL unmatched proposals unless explicitly kept for debugging
+            KEEP_UNMATCHED = os.getenv("KEEP_UNMATCHED_TABLES", "0").lower() in {"1","true","yes","on"}
+            if not KEEP_UNMATCHED:
+                table_candidates = [tc for tc in table_candidates if tc.get("type") == "table_candidate_cv_matched"]
+
+            # Save crops only for the kept (matched or explicitly kept) tables
+            if table_candidates:
+                _save_table_crops(pdf_path, page_number, table_candidates, out_dir="tables", dpi=150)
+        else:
+            table_candidates = []  # no table captions on page → no tables
+
+
+    # --- avoid double labeling vs figures: prefer table when grid strong ---
+    if figure_candidates and table_candidates:
+        import os
+        PREFER_GRID = float(os.getenv("TABLE_GRID_PREFER_THRESH", "0.010"))
+        kept_figs = []
+        for fc in figure_candidates:
+            fb = tuple(fc["bbox"])
+            drop = False
+            for tc in table_candidates:
+                tb = tuple(tc["bbox"])
+                if _iou(fb, tb) >= 0.60 and tc.get("grid_score", 0.0) >= PREFER_GRID:
+                    drop = True
+                    break
+            if not drop:
+                kept_figs.append(fc)
+        figure_candidates = kept_figs
+
+    # --- remove text blocks that lie inside any figure OR table (overlay clarity) ---
     blocks_all = [b.to_dict() for b in labeled]
     removed_inside: List[Dict[str, Any]] = []
     kept_blocks: List[Dict[str, Any]] = []
 
-    if figure_candidates:
+    any_regions = bool(figure_candidates) or bool(table_candidates)
+    if any_regions:
         for b in blocks_all:
             t = b.get("type")
             # only purge general text; captions/legend/status live outside figures
             if t == "body_text":
-                if any(_ioa_block_in_fig(tuple(b["bbox"]), tuple(fc["bbox"])) >= 0.5
-                       for fc in figure_candidates):
+                inside_fig = any(_ioa_block_in_fig(tuple(b["bbox"]), tuple(fc["bbox"])) >= 0.5
+                                 for fc in figure_candidates)
+                inside_tbl = any(_ioa_block_in_fig(tuple(b["bbox"]), tuple(tc["bbox"])) >= 0.5
+                                 for tc in table_candidates)
+                if inside_fig or inside_tbl:
                     removed_inside.append(b)
                     continue
             kept_blocks.append(b)
@@ -657,6 +968,7 @@ def detect_layout(
         "page_size": (rep.width, rep.height),
         "blocks": kept_blocks,                  # (already filtered of text inside figures)
         "figure_candidates": figure_candidates, # may include "image_uri"
+        "table_candidates": table_candidates,   # may include "image_uri", "caption_text", "grid_score"
     }
 
     # --- ALWAYS save layout assets when we have the inputs ---
@@ -711,12 +1023,15 @@ if __name__ == "__main__":
     # colors
     COLORS = {
         "caption": (0, 122, 255, 255),  # blue
+        "table_caption": (255, 214, 10, 255),  # yellow
         "legend_item": (255, 149, 0, 255),  # orange
         "status": (175, 82, 222, 255),  # purple
         "section_header": (52, 199, 89, 255),  # green
         "body_text": (142, 142, 147, 180),  # gray
         "figure_candidate": (255, 59, 48, 255),  # red
         "figure_candidate_cv": (255, 59, 48, 255),
+        "table_candidate_cv": (255, 214, 10, 255),
+        "table_candidate_cv_matched": (255, 214, 10, 255),
     }
 
     # draw text blocks
@@ -735,6 +1050,15 @@ if __name__ == "__main__":
         x0, y0, *_ = box
         tag = fc.get("type", "figure_candidate")
         draw.text((x0 + 3, y0 + 3), tag, fill=color)
+ 
+    # draw table candidates
+    for tc in layout.get("table_candidates", []):
+        box = to_px(tc["bbox"])
+        color = COLORS.get(tc.get("type"), (255, 214, 10, 255))
+        draw.rectangle(box, outline=color, width=4)
+        x0, y0, *_ = box
+        tag = tc.get("type", "table_candidate")
+        draw.text((x0 + 3, y0 + 3), tag, fill=color)
 
     # 4) save overlay image
     png_path = os.path.join(out_dir, f"layout_p{page_number:03d}.png")
@@ -747,12 +1071,14 @@ if __name__ == "__main__":
         "saved_png": png_path,
         "counts": {
             "captions": sum(1 for b in layout["blocks"] if b["type"] == "caption"),
+            "table_captions": sum(1 for b in layout["blocks"] if b["type"] == "table_caption"),
             "legend_items": sum(1 for b in layout["blocks"] if b["type"] == "legend_item"),
             "status": sum(1 for b in layout["blocks"] if b["type"] == "status"),
             "section_headers": sum(1 for b in layout["blocks"] if b["type"] == "section_header"),
             "body_text": sum(1 for b in layout["blocks"] if b["type"] == "body_text"),
         },
         "figure_candidates": len(layout["figure_candidates"]),
+        "table_candidates": len(layout.get("table_candidates", [])),
     })
 
     doc.close()
