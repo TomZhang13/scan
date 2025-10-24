@@ -16,3 +16,6 @@ layouts/
 
 # tables produced
 tables/
+
+# json produced
+out_json/
