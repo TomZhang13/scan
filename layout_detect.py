@@ -2,12 +2,13 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple, Optional
-import re
+import re, os, io, json
+from PIL import Image, ImageDraw
+from collections import defaultdict
 
 from first_step_loader import PageRep
 
 # cv2 / numpy / fitz for visual figure detection
-import io
 import numpy as np
 import cv2
 import fitz  # PyMuPDF
@@ -90,8 +91,6 @@ def _iou(a: Tuple[float,float,float,float], b: Tuple[float,float,float,float]) -
     bb = max(1e-6, (bx1 - bx0) * (by1 - by0))
     return inter / max(1e-6, aa + bb - inter)
 
-import os
-
 # Capture the numeric part and an optional trailing letter (with/without parentheses)
 _FID_RE = re.compile(r"(\d+(?:-\d+)+)\s*(?:\(?([A-Za-z])\)?)?")
 
@@ -132,7 +131,6 @@ def _save_figure_crops(pdf_path: str,
     Crop each candidate bbox and (optionally) inpaint tiny text rectangles inside.
     Inpainting is OFF by default to avoid smearing figures.
     """
-    import os
     os.makedirs(out_dir, exist_ok=True)
 
     doc = fitz.open(pdf_path)
@@ -226,7 +224,6 @@ def _save_table_crops(pdf_path: str,
     Crop and save each table bbox as PNG. No inpainting—keep grid/text intact.
     Writes absolute path to cand['image_uri'].
     """
-    import os
     os.makedirs(out_dir, exist_ok=True)
 
     doc = fitz.open(pdf_path)
@@ -252,16 +249,11 @@ def _save_table_crops(pdf_path: str,
     doc.close()
 
 
-import os, io, json
-from PIL import Image, ImageDraw
-
 def _save_layout_assets(pdf_path: str,
                         page_number: int,
                         layout: Dict[str, Any],
                         out_dir: str = "layouts",
                         dpi: int = 150) -> None:
-    import os, io, json
-    from PIL import Image, ImageDraw
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -383,7 +375,6 @@ def _detect_fig_rects_via_cv(
     cnts, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
     # ADAPTIVE GATES (looser defaults; override via env if needed)
-    import os
     min_area_frac = float(os.getenv("FIG_MIN_AREA_FRAC", "0.003"))  # was 0.005
     max_area_frac = float(os.getenv("FIG_MAX_AREA_FRAC", "0.85"))   # was 0.75
     min_dim_frac  = float(os.getenv("FIG_MIN_DIM_FRAC",  "0.014"))  # was ~0.018
@@ -509,7 +500,6 @@ def _detect_table_rects_via_cv(
     cnts, _ = cv2.findContours(lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     page_area_px = float(W * H)
 
-    import os
     MIN_AREA_FRAC = float(os.getenv("TABLE_MIN_AREA_FRAC", "0.006"))   # tables can be sizable
     MAX_AREA_FRAC = float(os.getenv("TABLE_MAX_AREA_FRAC", "0.85"))
     MIN_DIM_FRAC  = float(os.getenv("TABLE_MIN_DIM_FRAC",  "0.02"))
@@ -629,7 +619,6 @@ def _ocr_text_blocks(pdf_path: str,
     prep = cv2.addWeighted(clahe, 1.5, blur, -0.5, 0)
 
     # ---- tunables (can override via env) ----
-    import os
     # Make per-word intake a bit more permissive; rely on segment median conf later
     MIN_WORD_CONF = int(os.getenv("MIN_WORD_CONF", "58"))   # was 66
     MIN_WORD_W_PX = int(os.getenv("MIN_WORD_W_PX", "4"))    # was 5
@@ -660,7 +649,6 @@ def _ocr_text_blocks(pdf_path: str,
         )
         n = len(data["text"])
 
-        from collections import defaultdict
         lines = defaultdict(list)
         all_word_w: List[int] = []
 
@@ -1003,7 +991,6 @@ def detect_layout(
                 table_candidates.append({"type": "table_candidate_cv", "bbox": p["bbox"], "grid_score": p["grid_score"]})
 
             # geometry-first association: table just below its caption, within a max vertical gap
-            import os
             MAX_GAP = float(os.getenv("TABLE_MAX_CAPTION_GAP_PT", "160.0"))  # PDF user space points
             used_tbl: List[Tuple[float,float,float,float]] = []
             for cap in t_caps:
@@ -1050,7 +1037,6 @@ def detect_layout(
 
     # --- avoid double labeling vs figures: prefer table when grid strong ---
     if figure_candidates and table_candidates:
-        import os
         PREFER_GRID = float(os.getenv("TABLE_GRID_PREFER_THRESH", "0.010"))
         kept_figs = []
         for fc in figure_candidates:
@@ -1124,9 +1110,6 @@ def detect_layout(
 
 # quick manual run
 if __name__ == "__main__":
-    import os, json, io
-    from pprint import pprint
-    from PIL import Image, ImageDraw
     from first_step_loader import load_pdf_page
 
     # ---- config ----
