@@ -499,12 +499,11 @@ def assemble_document_json(pdf_path: str, doc_id: str,
 if __name__ == "__main__":
     # ---- Configure your source PDF here (no CLI args needed) ----
     # Pick ONE of these or set your own path.
-    pdf_path = r"1-7/1.0/IPC_0002_SCH.pdf"
-    pdf_path = r"1-7/4.0/IPC_0023_SCH.pdf"
-    pdf_path = r"1-7/4.0/IPC_0026_SCH.pdf"
-    pdf_path = r"1-7/1.0/IPC_0003_SCH.pdf"
-    pdf_path = r"1-7/4.0/IPC_0027_SCH.pdf"
-    pdf_path = r"1-7/4.0/IPC_0018_SCH.pdf"  # <— currently active
+    pdf_path = r"1-7/2.0/IPC_0012_SCH.pdf" # many sections
+    pdf_path = r"1-7/1.0/IPC_0004_SCH.pdf" # 2 tables
+    pdf_path = r"1-7/1.0/IPC_0002_SCH.pdf" # many figures
+    pdf_path = r"1-7/4.0/IPC_0018_SCH.pdf"  # standard test
+    pdf_path = r"1-7/5.0/IPC_0055_SCH.pdf" # flat figures
 
     # Set the document ID explicitly (do NOT infer). Update as needed.
     DOC_ID = "IPC-A-610J"  # or set to "PENDING:doc id" and fill later

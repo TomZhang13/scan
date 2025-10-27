@@ -55,15 +55,6 @@ def _area(b):
     return max(0.0, x1 - x0) * max(0.0, y1 - y0)
 
 
-def _horiz_overlap_ratio(a: Tuple[float,float,float,float],
-                         b: Tuple[float,float,float,float]) -> float:
-    ax0, _, ax1, _ = a
-    bx0, _, bx1, _ = b
-    inter = max(0.0, min(ax1, bx1) - max(ax0, bx0))
-    aw = max(1e-6, ax1 - ax0)
-    return inter / aw
-
-
 def _overlap_area(a: Tuple[float,float,float,float],
                   b: Tuple[float,float,float,float]) -> float:
     ax0, ay0, ax1, ay1 = a
@@ -337,6 +328,21 @@ def _overlap_ratio_to(rect: Tuple[float,float,float,float], x0: float, x1: float
     inter = max(0.0, min(rx1, x1) - max(rx0, x0))
     rw = max(1e-6, rx1 - rx0)
     return inter / rw
+
+
+def _is_centered_horizontally(bbox: Tuple[float,float,float,float],
+                              page_w: float,
+                              *,
+                              margin_frac: float = 0.0) -> bool:
+    """
+    True if the box crosses the page midpoint horizontally.
+    'margin_frac' can require the left edge be left of (mid - margin) and
+    the right edge be right of (mid + margin).
+    """
+    x0, _, x1, _ = bbox
+    mid = 0.5 * page_w
+    margin = margin_frac * page_w
+    return (x0 <= mid - margin) and (x1 >= mid + margin)
 
 
 # ---------- detect rectangular figure frames via OpenCV ----------
@@ -919,7 +925,23 @@ def detect_layout(
         elif LEGEND_RE.match(t):
             label = "legend_item"
         elif SID_RE.match(t):
-            label = "section_header"
+            # Section headers must be centered. Optional: require a minimum height.
+            bx0, by0, bx1, by1 = tuple(ol["bbox"])
+            require_center = True  # always apply Criterion 1 by default
+            center_margin_frac = float(os.getenv("SECTION_CENTER_MARGIN_FRAC", "0.00"))
+            # Optional Criterion 2 (disabled by default): set to e.g. 0.018 (~1.8% of page height)
+            min_h_frac = float(os.getenv("SECTION_MIN_HEIGHT_FRAC", "0.00"))
+
+            passes_center = (not require_center) or _is_centered_horizontally(
+                (bx0, by0, bx1, by1), rep.width, margin_frac=center_margin_frac
+            )
+            passes_size = ((by1 - by0) >= (min_h_frac * rep.height)) if min_h_frac > 0 else True
+
+            if passes_center and passes_size:
+                label = "section_header"
+            else:
+                # Fails centering/size → treat as normal text, avoiding false section hits like "4.0 ..."
+                label = "body_text"
         elif STATUS_RE.search(t):
             label = "status"
         else:
