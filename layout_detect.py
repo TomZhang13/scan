@@ -510,7 +510,7 @@ def _detect_table_rects_via_cv(
     MAX_AREA_FRAC = float(os.getenv("TABLE_MAX_AREA_FRAC", "0.85"))
     MIN_DIM_FRAC  = float(os.getenv("TABLE_MIN_DIM_FRAC",  "0.02"))
     MIN_AR        = float(os.getenv("TABLE_MIN_AR",        "0.35"))
-    MAX_AR        = float(os.getenv("TABLE_MAX_AR",        "8.50"))
+    MAX_AR        = float(os.getenv("TABLE_MAX_AR",        "12.0"))
     PAD_FRAC      = float(os.getenv("TABLE_PAD_FRAC",      "0.004"))
     GRID_THRESH   = float(os.getenv("TABLE_GRID_THRESH",   "0.0045"))  # keep if >=
     BRIGHT_MIN    = float(os.getenv("TABLE_BRIGHT_MIN",    "160"))     # mean gray inside >=
@@ -534,6 +534,113 @@ def _detect_table_rects_via_cv(
         # inclusive-exclusive on integral image
         x0c, y0c, x1c, y1c = x0, y0, x1-1, y1-1
         return int(ii[y1c+1, x1c+1] - ii[y0c, x1c+1] - ii[y1c+1, x0c] + ii[y0c, x0c])
+
+    
+    # Add this RIGHT AFTER this line in _detect_table_rects_via_cv:
+    # cnts, _ = cv2.findContours(lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # ============ DEBUG VISUALIZATION CODE ============
+    DEBUG_VIS = False
+
+    if DEBUG_VIS:
+        debug_img = img.copy()
+        debug_lines = cv2.cvtColor(lines, cv2.COLOR_GRAY2BGR)
+        debug_edges = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+        
+        print(f"\n=== TABLE DETECTION DEBUG ===")
+        print(f"Image size: {W}x{H}")
+        print(f"Found {len(cnts)} contours from lines")
+        print(f"Min area: {min_area:.0f} px² ({MIN_AREA_FRAC*100:.2f}% of page)")
+        print(f"Max area: {max_area:.0f} px² ({MAX_AREA_FRAC*100:.2f}% of page)")
+        print(f"Min dim: {min_dim_px} px")
+        print(f"Grid thresh: {GRID_THRESH}")
+        print(f"Bright min: {BRIGHT_MIN}")
+        
+        for idx, c in enumerate(cnts):
+            x, y, w, h = cv2.boundingRect(c)
+            area = w * h
+            
+            line_pix = sum_region(lines_int, x, y, x + w, y + h)
+            gridness = line_pix / float(area + 1e-6)
+            gray_sum = sum_region(gray_int, x, y, x + w, y + h)
+            mean_gray = gray_sum / float(area + 1e-6)
+            ar = w / float(h)
+            
+            # Check ALL conditions and collect ALL failures
+            failures = []
+            
+            if area < min_area:
+                failures.append(f"area_too_small({area:.0f}<{min_area:.0f})")
+            elif area > max_area:
+                failures.append(f"area_too_large({area:.0f}>{max_area:.0f})")
+            
+            if w < min_dim_px or h < min_dim_px:
+                failures.append(f"dim_too_small({w}x{h}<{min_dim_px})")
+            
+            # Edge check
+            spans_full_width = (x <= 0.30 * W) and ((x + w) >= 0.70 * W)
+            if spans_full_width:
+                if y < pad_from_edge or (y + h) > (H - pad_from_edge):
+                    failures.append(f"near_VERTICAL_edge(spans_full_width=True)")
+            else:
+                if x < pad_from_edge or y < pad_from_edge or \
+                (x + w) > (W - pad_from_edge) or (y + h) > (H - pad_from_edge):
+                    failures.append(f"near_edge(spans_full_width=False)")
+            
+            if not (MIN_AR <= ar <= MAX_AR):
+                failures.append(f"bad_aspect({ar:.2f}, need {MIN_AR}-{MAX_AR})")
+            
+            if gridness < GRID_THRESH:
+                failures.append(f"low_grid({gridness:.4f}<{GRID_THRESH})")
+            
+            if mean_gray < BRIGHT_MIN:
+                failures.append(f"too_dark({mean_gray:.0f}<{BRIGHT_MIN})")
+            
+            # Color based on PRIMARY failure
+            if not failures:
+                color = (0, 255, 0)  # Green = PASS
+            elif "low_grid" in failures[0]:
+                color = (0, 255, 255)  # Yellow
+            elif "too_dark" in failures[0]:
+                color = (128, 0, 128)  # Purple
+            elif "near_" in failures[0]:
+                color = (255, 0, 0)  # Blue
+            else:
+                color = (0, 0, 255)  # Red
+            
+            cv2.rectangle(debug_img, (x, y), (x+w, y+h), color, 3)
+            cv2.putText(debug_img, f"#{idx}", (x+5, y+20), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
+            status = "✓ PASS" if not failures else "✗ FAIL"
+            print(f"\n{'='*60}")
+            print(f"Contour #{idx}: {status}")
+            print(f"  BBox: x={x}, y={y}, w={w}, h={h}, area={area:.0f}")
+            print(f"  Spans full width? {spans_full_width} (x<={0.30*W:.0f}, x+w>={0.70*W:.0f})")
+            print(f"  Aspect ratio: {ar:.2f} (need {MIN_AR}-{MAX_AR})")
+            print(f"  Gridness: {gridness:.4f} (need >={GRID_THRESH})")
+            print(f"  Brightness: {mean_gray:.0f} (need >={BRIGHT_MIN})")
+            if failures:
+                print(f"  ❌ FAILED CHECKS: {', '.join(failures)}")
+        
+        print(f"\n{'='*60}")
+        print(f"=== Press any key to continue ===\n")
+        
+        # Resize and show
+        max_display = 1200
+        if W > max_display or H > max_display:
+            scale = max_display / max(W, H)
+            debug_img = cv2.resize(debug_img, (int(W*scale), int(H*scale)))
+            debug_lines = cv2.resize(debug_lines, (int(W*scale), int(H*scale)))
+            debug_edges = cv2.resize(debug_edges, (int(W*scale), int(H*scale)))
+        
+        cv2.imshow("1. Original with Contours", debug_img)
+        cv2.imshow("2. Line Detection", debug_lines)
+        cv2.imshow("3. Edge Detection", debug_edges)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    # ============ END DEBUG ============
+
 
     for c in cnts:
         x, y, w, h = cv2.boundingRect(c)

@@ -478,7 +478,6 @@ def assemble_document_json(pdf_path: str, doc_id: str,
     with open(out_min, "w", encoding="utf-8") as f:
         json.dump(final_json, f, ensure_ascii=False, separators=(",", ":"))
 
-    # prints moved below
     # Light log summary
     total_figs = sum(len(s.get("figures", [])) for s in sections_out)
     print("===============================================")
@@ -500,10 +499,13 @@ if __name__ == "__main__":
     # ---- Configure your source PDF here (no CLI args needed) ----
     # Pick ONE of these or set your own path.
     pdf_path = r"1-7/2.0/IPC_0012_SCH.pdf" # many sections
-    pdf_path = r"1-7/1.0/IPC_0004_SCH.pdf" # 2 tables
     pdf_path = r"1-7/1.0/IPC_0002_SCH.pdf" # many figures
-    pdf_path = r"1-7/4.0/IPC_0018_SCH.pdf"  # standard test
     pdf_path = r"1-7/5.0/IPC_0055_SCH.pdf" # flat figures
+    pdf_path = r"1-7/4.0/IPC_0018_SCH.pdf" # standard test
+    pdf_path = r"1-7/4.0/IPC_0016_SCH.pdf" # 2 sections side by side
+    pdf_path = r"1-7/1.0/IPC_0010_SCH.pdf" # big table
+    pdf_path = r"1-7/5.0/IPC_0036_SCH.pdf" # weird figure
+    pdf_path = r"1-7/1.0/IPC_0004_SCH.pdf" # 2 tables
 
     # Set the document ID explicitly (do NOT infer). Update as needed.
     DOC_ID = "IPC-A-610J"  # or set to "PENDING:doc id" and fill later
