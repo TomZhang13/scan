@@ -1018,15 +1018,49 @@ def detect_layout(
     pdf_path: Optional[str] = None,
     page_number: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """OCR-only text labeling + figure candidates (image/CV), with figure crops + overlay saves."""
+    """Hybrid text labeling + figure candidates (image/CV), with figure crops + overlay saves.
+
+    Uses native PDF text when available and sufficient; falls back to OCR otherwise.
+    """
     labeled: List[LabeledBlock] = []
 
-    # --- OCR-only text extraction ---
-    # (Requires pdf_path + page_number. If missing, no text blocks will be produced.)
-    if pdf_path is not None and page_number is not None:
-        ocr_lines = _ocr_text_blocks(pdf_path, page_number, rep.width, rep.height, dpi=300)
+    # --- Prefer native PDF text, fall back to OCR ---
+    def _native_blocks_from_rep() -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        try:
+            for tb in getattr(rep, "text_blocks", []) or []:
+                t = (getattr(tb, "text", "") or "").strip()
+                if not t:
+                    continue
+                b = getattr(tb, "bbox", None)
+                if not b:
+                    continue
+                out.append({"text": t, "bbox": tuple(b)})
+        except Exception:
+            pass
+        return out
+
+    def _enough_native(blocks: List[Dict[str, Any]]) -> bool:
+        if not blocks:
+            return False
+        char_count = sum(len(b.get("text") or "") for b in blocks)
+        block_count = sum(1 for b in blocks if (b.get("text") or "").strip())
+        area_sum = sum(_area(tuple(b.get("bbox", (0, 0, 0, 0)))) for b in blocks)
+        coverage = area_sum / max(1.0, (rep.width * rep.height))
+
+        min_chars = int(os.getenv("NATIVE_TEXT_MIN_CHARS", "80"))
+        min_blocks = int(os.getenv("NATIVE_TEXT_MIN_BLOCKS", "3"))
+        min_cover = float(os.getenv("NATIVE_TEXT_MIN_COVERAGE", "0.001"))
+        return (char_count >= min_chars and block_count >= min_blocks) or (coverage >= min_cover)
+
+    native_lines = _native_blocks_from_rep() if getattr(rep, "source_type", "") == "pdf" else []
+    if _enough_native(native_lines):
+        ocr_lines = native_lines
     else:
-        ocr_lines = []
+        if pdf_path is not None and page_number is not None:
+            ocr_lines = _ocr_text_blocks(pdf_path, page_number, rep.width, rep.height, dpi=300)
+        else:
+            ocr_lines = []
 
     # Label OCR lines
     for ol in ocr_lines:
