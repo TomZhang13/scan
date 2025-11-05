@@ -3,7 +3,10 @@ from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Tuple, Optional
 
 # --- stdlib ---
-import os, json, re, math
+import json
+import math
+import os
+import re
 
 # PDF deps
 import fitz  # PyMuPDF
@@ -501,11 +504,11 @@ if __name__ == "__main__":
     pdf_path = r"1-7/2.0/IPC_0012_SCH.pdf" # many sections
     pdf_path = r"1-7/1.0/IPC_0002_SCH.pdf" # many figures
     pdf_path = r"1-7/5.0/IPC_0055_SCH.pdf" # flat figures
-    pdf_path = r"1-7/4.0/IPC_0018_SCH.pdf" # standard test
     pdf_path = r"1-7/4.0/IPC_0016_SCH.pdf" # 2 sections side by side
     pdf_path = r"1-7/1.0/IPC_0010_SCH.pdf" # big table
     pdf_path = r"1-7/5.0/IPC_0036_SCH.pdf" # weird figure
     pdf_path = r"1-7/1.0/IPC_0004_SCH.pdf" # 2 tables
+    pdf_path = r"1-7/4.0/IPC_0018_SCH.pdf" # standard test
 
     pdf_paths = [
         r"1-7/2.0/IPC_0012_SCH.pdf",  # many sections
@@ -520,6 +523,8 @@ if __name__ == "__main__":
 
     # Set the document ID explicitly (do NOT infer). Update as needed.
     DOC_ID = "IPC-A-610J"  # or set to "PENDING:doc id" and fill later
+
+    # assemble_document_json(pdf_path, DOC_ID)
 
     for pdf_path in pdf_paths:
         # Run the full pipeline (loads pages, runs layout/association, assembles JSON, saves it)

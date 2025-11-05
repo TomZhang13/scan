@@ -2,17 +2,25 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple, Optional
-import re, os, io, json
-from PIL import Image, ImageDraw
+
+# Standard library
 from collections import defaultdict
+import io
+import json
+import os
+import re
 
-from first_step_loader import PageRep
-
-# cv2 / numpy / fitz for visual figure detection
-import numpy as np
+# Third-party
 import cv2
 import fitz  # PyMuPDF
+import numpy as np
+from PIL import Image
+from PIL import ImageDraw
 import pytesseract
+
+# Local
+from first_step_loader import PageRep
+
 # https://github.com/UB-Mannheim/tesseract/wiki
 pytesseract.pytesseract.tesseract_cmd = r"C:\Users\tomz\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
 
