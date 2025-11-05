@@ -507,8 +507,20 @@ if __name__ == "__main__":
     pdf_path = r"1-7/5.0/IPC_0036_SCH.pdf" # weird figure
     pdf_path = r"1-7/1.0/IPC_0004_SCH.pdf" # 2 tables
 
+    pdf_paths = [
+        r"1-7/2.0/IPC_0012_SCH.pdf",  # many sections
+        r"1-7/1.0/IPC_0002_SCH.pdf",  # many figures
+        r"1-7/5.0/IPC_0055_SCH.pdf",  # flat figures
+        r"1-7/4.0/IPC_0018_SCH.pdf",  # standard test
+        r"1-7/4.0/IPC_0016_SCH.pdf",  # 2 sections side by side
+        r"1-7/1.0/IPC_0010_SCH.pdf",  # big table
+        r"1-7/5.0/IPC_0036_SCH.pdf",  # weird figure
+        r"1-7/1.0/IPC_0004_SCH.pdf",  # 2 tables
+    ]
+
     # Set the document ID explicitly (do NOT infer). Update as needed.
     DOC_ID = "IPC-A-610J"  # or set to "PENDING:doc id" and fill later
 
-    # Run the full pipeline (loads pages, runs layout/association, assembles JSON, saves it)
-    assemble_document_json(pdf_path, DOC_ID)
+    for pdf_path in pdf_paths:
+        # Run the full pipeline (loads pages, runs layout/association, assembles JSON, saves it)
+        assemble_document_json(pdf_path, DOC_ID)

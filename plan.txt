@@ -245,9 +245,20 @@ Semantic tagging	regex + optional LLM
 ----------chat link----------
 https://chatgpt.com/share/68f8e6f9-6450-800f-b53f-5549b8b0b707
 
-----------Ridika----------
-you need to move the folder 1-7 to this directory
-can work on steps 3, 4, 6-
+----------Install----------
+requirements.txt
+download terrasect from https://github.com/UB-Mannheim/tesseract/wiki
+add path in layout_detect.py, line 16
+move the pdfs to root dir:
+scan/
+  1-7/
+    1.0/
+      IPC_0130_SCH.pdf
+      ...
+    2.0/
+      ...
+    ...
+
 
 ----------flow----------
 first_step_loader -> layout_detect -> figure_association
