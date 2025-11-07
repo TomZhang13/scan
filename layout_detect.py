@@ -1020,11 +1020,12 @@ def detect_layout(
 ) -> Dict[str, Any]:
     """Hybrid text labeling + figure candidates (image/CV), with figure crops + overlay saves.
 
-    Uses native PDF text when available and sufficient; falls back to OCR otherwise.
+    Always runs OCR; native PDF text is preferred and OCR boxes are only added when they do not
+    significantly overlap existing boxes.
     """
     labeled: List[LabeledBlock] = []
 
-    # --- Prefer native PDF text, fall back to OCR ---
+    # --- Collect native PDF text and merge with OCR output ---
     def _native_blocks_from_rep() -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         try:
@@ -1040,30 +1041,37 @@ def detect_layout(
             pass
         return out
 
-    def _enough_native(blocks: List[Dict[str, Any]]) -> bool:
-        if not blocks:
-            return False
-        char_count = sum(len(b.get("text") or "") for b in blocks)
-        block_count = sum(1 for b in blocks if (b.get("text") or "").strip())
-        area_sum = sum(_area(tuple(b.get("bbox", (0, 0, 0, 0)))) for b in blocks)
-        coverage = area_sum / max(1.0, (rep.width * rep.height))
-
-        min_chars = int(os.getenv("NATIVE_TEXT_MIN_CHARS", "80"))
-        min_blocks = int(os.getenv("NATIVE_TEXT_MIN_BLOCKS", "3"))
-        min_cover = float(os.getenv("NATIVE_TEXT_MIN_COVERAGE", "0.001"))
-        return (char_count >= min_chars and block_count >= min_blocks) or (coverage >= min_cover)
-
     native_lines = _native_blocks_from_rep() if getattr(rep, "source_type", "") == "pdf" else []
-    if _enough_native(native_lines):
-        ocr_lines = native_lines
-    else:
-        if pdf_path is not None and page_number is not None:
-            ocr_lines = _ocr_text_blocks(pdf_path, page_number, rep.width, rep.height, dpi=300)
-        else:
-            ocr_lines = []
+    ocr_lines: List[Dict[str, Any]] = []
+    if pdf_path is not None and page_number is not None:
+        ocr_lines = _ocr_text_blocks(pdf_path, page_number, rep.width, rep.height, dpi=300)
 
-    # Label OCR lines
+    text_lines: List[Dict[str, Any]] = []
+    existing_boxes: List[Tuple[float, float, float, float]] = []
+
+    def _append_line(line: Dict[str, Any]) -> None:
+        text_lines.append(line)
+        bbox = tuple(line.get("bbox", ()))
+        if len(bbox) == 4:
+            existing_boxes.append(tuple(float(v) for v in bbox))
+
+    for nl in native_lines:
+        _append_line(nl)
+
+    iou_thresh = float(os.getenv("OCR_NATIVE_MAX_IOU", "0.6"))
     for ol in ocr_lines:
+        bbox = tuple(ol.get("bbox", ()))
+        if len(bbox) != 4:
+            continue
+        bbox_f = tuple(float(v) for v in bbox)
+        if all(_iou(bbox_f, eb) < iou_thresh for eb in existing_boxes):
+            _append_line(ol)
+
+    if not text_lines:
+        text_lines = ocr_lines
+
+    # Label merged text lines
+    for ol in text_lines:
         t = (ol.get("text") or "").strip()
         if not t:
             continue
