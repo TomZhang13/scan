@@ -19,3 +19,5 @@ tables/
 
 # json produced
 out_json/
+
+.env

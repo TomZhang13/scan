@@ -46,14 +46,13 @@
   "derived_tags": ["class:1,2,3","topic:hardware-sequence"]
 }
 
-I think a good place to start is extracting the images and labeling them by their figure #, Figure and Table
-
+here is the original plan of the project (current project might have deviated from this):
 ----------plan----------
 Here’s a concise recap of the custom method I proposed, including the tools and libraries to use for each step.
 
 🔧 Overall Goal
 
-Parse technical manual pages (like your screenshot) into a structured JSON:
+Parse technical manual pages into a structured JSON:
 
 Identify sections, figures, tables.
 
@@ -96,14 +95,7 @@ Each block → {"type": "figure|caption|text|table|header", "bbox": [...]}
 
 Goal: Get readable text from each region.
 Tools:
-
-PaddleOCR
- — strong at multi-language and small fonts.
-
-docTR
- — end-to-end OCR alternative.
-
-Optionally fallback to Tesseract (pytesseract) for simple cases.
+Tesseract (pytesseract).
 
 4. Section Extraction
 
@@ -182,7 +174,7 @@ PDF: Camelot
 
 Images: CascadeTabNet model (for visual table detection) + OCR.
 
-Save as CSV → upload to S3 if needed.
+Save as CSV.
 
 9. Derived Tags
 
@@ -229,39 +221,6 @@ Everything flows into a schema like:
   ],
   "derived_tags": ["class:1,2,3", "topic:hardware-sequence"]
 }
-
-🧩 Library Summary
-Purpose	Library
-PDF text, image, geometry	PyMuPDF (fitz)
-Page segmentation	layoutparser + Detectron2, or docTR
-OCR	PaddleOCR (preferred) or Tesseract
-Figure–caption logic, regex	re, custom heuristics
-Hotspot detection	OpenCV, PaddleOCR, optional YOLOv8
-Table extraction	Camelot / Tabula (PDF), or CascadeTabNet (image)
-Data modeling	Pydantic, json
-Storage	boto3 (for S3)
-Semantic tagging	regex + optional LLM
-
-----------chat link----------
-https://chatgpt.com/share/68f8e6f9-6450-800f-b53f-5549b8b0b707
-
-----------Install----------
-requirements.txt
-download terrasect from https://github.com/UB-Mannheim/tesseract/wiki
-add path in layout_detect.py, line 16
-move the pdfs to root dir:
-scan/
-  1-7/
-    1.0/
-      IPC_0130_SCH.pdf
-      ...
-    2.0/
-      ...
-    ...
-
-
-----------flow----------
-first_step_loader -> layout_detect -> figure_association
 
 ----------steps (check above for full plan)----------
 1. Load & Represent Pages (done, first_step_loader)

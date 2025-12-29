@@ -17,12 +17,16 @@ import numpy as np
 from PIL import Image
 from PIL import ImageDraw
 import pytesseract
+from dotenv import load_dotenv
 
 # Local
 from first_step_loader import PageRep
 
 # https://github.com/UB-Mannheim/tesseract/wiki
-pytesseract.pytesseract.tesseract_cmd = r"C:\Users\tomz\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+load_dotenv()
+_tess_cmd = os.getenv("TESSERACT_CMD")
+if _tess_cmd:
+    pytesseract.pytesseract.tesseract_cmd = _tess_cmd
 
 
 # ---- Simple labeled block ----

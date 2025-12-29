@@ -1,3 +1,5 @@
+REM delete all output files, simply enter "d" in the command line
+
 @echo off
 del /q ".\figures\*.*"
 del /q ".\layouts\*.*"
