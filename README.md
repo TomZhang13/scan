@@ -30,7 +30,7 @@ Parses IPC documents to extract JSON data, figures, and tables.
 - Auto-fill `doc_id` instead of hardcoding it in `first_step_loader.py`.
 - Extract section body text (now `PENDING:section text assembly`).
 - Extract figure hotspots (labels/text/bboxes) instead of placeholder `PENDING` entries.
-- Generate table CSVs (`csv_uri` now `PENDING`); planned tools: Camelot/Tabula for PDFs, visual table detector for images.
+- Parse and save tables as CSVs instead of just saving them as images (`csv_uri` now `PENDING`); planned tools: Camelot/Tabula for PDFs, visual table detector for images.
 - Detect numbered hotspots inside figure crops (contour/shape filter + OCR of digits) and link them to legend map.
 - Fill classification tags via rules (e.g., class 1/2/3 → `class:1,2,3`, hardware keywords → `topic:hardware-sequence`) instead of the current `PENDING` placeholders.
 

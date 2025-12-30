@@ -4,3 +4,4 @@ packaging==25.0
 pillow==12.0.0
 PyMuPDF==1.26.5
 pytesseract==0.3.13
+python-dotenv==1.2.1
